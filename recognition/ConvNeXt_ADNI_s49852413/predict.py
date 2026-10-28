@@ -191,7 +191,7 @@ def plot_sample_predictions_grid(
         )
 
     fig.suptitle(
-        f"ConvNeXt Test Inference & Grad-CAM Attribution Showcase (Temperature T* = {temperature:.2f}, Triage τ* = {triage_tau:.2f})",
+        f"ConvNeXt Test Inference & Stage-3 (6×6) Grad-CAM Attribution (T* = {temperature:.2f}, Val-Selected τ* = {triage_tau:.2f})",
         fontsize=13,
         fontweight="bold",
         y=1.02,
@@ -209,9 +209,9 @@ def conduct_failure_case_autopsy(
     baseline_probs: Optional[np.ndarray],
     device: torch.device,
     out_path: Path,
-    triage_tau: float = 0.80,
+    triage_tau: float = 0.75,
 ) -> List[Dict[str, object]]:
-    """Select 4 representative failure cases (2 FN, 2 FP) and generate a 4-panel autopsy plot."""
+    """Select 4 failure cases (1 intercepted FN, 1 high-conf escaped FN, 1 intercepted FP, 1 high-conf escaped FP) and generate quantitative autopsy."""
     y_true = np.array([r.label for r in test_ds.records])
     raw_probs = F.softmax(raw_logits, dim=-1).numpy()
     cal_probs = F.softmax(raw_logits / temperature, dim=-1).numpy()
@@ -219,45 +219,50 @@ def conduct_failure_case_autopsy(
     cal_conf = np.max(cal_probs, axis=1)
     raw_conf = np.max(raw_probs, axis=1)
 
+    # Pre-compute per-scan slice index ranges and 20-slice scan-level mean AD probability
+    scan_slice_indices: Dict[str, List[int]] = {}
+    scan_ad_probs: Dict[str, List[float]] = {}
+    for i, r in enumerate(test_ds.records):
+        scan_slice_indices.setdefault(r.patient_id, []).append(int(r.slice_index))
+        scan_ad_probs.setdefault(r.patient_id, []).append(float(cal_probs[i, 1]))
+
     fn_indices = np.where((y_true == 1) & (y_pred == 0))[0]
     fp_indices = np.where((y_true == 0) & (y_pred == 1))[0]
 
-    # Pick 2 FN slices (preferring distinct patients) and 2 FP slices (preferring distinct patients)
+    # Select 2 FN (1 intercepted < tau*, 1 escaped high-conf >= tau*) and 2 FP (1 intercepted < tau*, 1 escaped high-conf >= tau*)
     chosen_cases: List[Tuple[int, str]] = []
     seen_pids: set[str] = set()
     seen_indices: set[int] = set()
 
-    fn_sorted = sorted(fn_indices.tolist(), key=lambda i: cal_conf[i])
-    for idx in fn_sorted:
-        pid = test_ds.records[idx].patient_id
-        if pid not in seen_pids:
-            chosen_cases.append((idx, "False Negative (Missed AD)"))
-            seen_pids.add(pid)
-            seen_indices.add(idx)
-        if len(chosen_cases) >= 2:
-            break
-    for idx in fn_sorted:
-        if len(chosen_cases) >= 2:
-            break
-        if idx not in seen_indices:
-            chosen_cases.append((idx, "False Negative (Missed AD)"))
-            seen_indices.add(idx)
+    def _pick_case(candidates: List[int], label_desc: str) -> None:
+        for idx in candidates:
+            pid = test_ds.records[idx].patient_id
+            if pid not in seen_pids and idx not in seen_indices:
+                chosen_cases.append((idx, label_desc))
+                seen_pids.add(pid)
+                seen_indices.add(idx)
+                return
+        for idx in candidates:
+            if idx not in seen_indices:
+                chosen_cases.append((idx, label_desc))
+                seen_indices.add(idx)
+                return
 
-    fp_sorted = sorted(fp_indices.tolist(), key=lambda i: cal_conf[i])
-    for idx in fp_sorted:
-        pid = test_ds.records[idx].patient_id
-        if pid not in seen_pids:
-            chosen_cases.append((idx, "False Positive (False AD Alarm)"))
-            seen_pids.add(pid)
-            seen_indices.add(idx)
-        if len(chosen_cases) >= 4:
-            break
-    for idx in fp_sorted[-1::-1]:
-        if len(chosen_cases) >= 4:
-            break
-        if idx not in seen_indices:
-            chosen_cases.append((idx, "False Positive (False AD Alarm)"))
-            seen_indices.add(idx)
+    fn_intercepted = sorted([int(i) for i in fn_indices if cal_conf[i] < triage_tau], key=lambda i: cal_conf[i])
+    fn_escaped = sorted([int(i) for i in fn_indices if cal_conf[i] >= triage_tau], key=lambda i: -cal_conf[i])
+    fn_all_asc = sorted([int(i) for i in fn_indices], key=lambda i: cal_conf[i])
+    fn_all_desc = sorted([int(i) for i in fn_indices], key=lambda i: -cal_conf[i])
+
+    _pick_case(fn_intercepted or fn_all_asc, "False Negative (Intercepted Borderline AD)")
+    _pick_case(fn_escaped or fn_all_desc, "False Negative (High-Conf Escaped AD)")
+
+    fp_intercepted = sorted([int(i) for i in fp_indices if cal_conf[i] < triage_tau], key=lambda i: cal_conf[i])
+    fp_escaped = sorted([int(i) for i in fp_indices if cal_conf[i] >= triage_tau], key=lambda i: -cal_conf[i])
+    fp_all_asc = sorted([int(i) for i in fp_indices], key=lambda i: cal_conf[i])
+    fp_all_desc = sorted([int(i) for i in fp_indices], key=lambda i: -cal_conf[i])
+
+    _pick_case(fp_intercepted or fp_all_asc, "False Positive (Intercepted Borderline NC)")
+    _pick_case(fp_escaped or fp_all_desc, "False Positive (High-Conf Escaped NC)")
 
     fig, axes = plt.subplots(len(chosen_cases), 4, figsize=(16.5, 3.6 * len(chosen_cases)), dpi=180)
     if len(chosen_cases) == 1:
@@ -274,6 +279,10 @@ def conduct_failure_case_autopsy(
         cam = compute_spatial_attribution(convnext_model, x_tensor, target_class=int(y_pred[ds_idx]))
         cam_np = cam[0].detach().cpu().numpy()
 
+        # Also compute 6x6 coarse grid peak coordinates
+        cam_6x6 = F.adaptive_avg_pool2d(cam.unsqueeze(1), (6, 6))[0, 0].detach().cpu().numpy()
+        peak_r, peak_c = np.unravel_index(int(np.argmax(cam_6x6)), cam_6x6.shape)
+
         c_raw = float(raw_conf[ds_idx])
         c_cal = float(cal_conf[ds_idx])
         p_ad_cal = float(cal_probs[ds_idx, 1])
@@ -285,41 +294,43 @@ def conduct_failure_case_autopsy(
 
         routed_to_human = c_cal < triage_tau
 
-        # Compute anatomical triggers from slice intensity structure
+        # Quantitative slice and scan telemetry
         fg_mask = raw_img > 0.05
-        central_box = raw_img[int(0.32 * raw_img.shape[0]) : int(0.68 * raw_img.shape[0]),
-                              int(0.32 * raw_img.shape[1]) : int(0.68 * raw_img.shape[1])]
+        central_box = raw_img[
+            int(0.32 * raw_img.shape[0]) : int(0.68 * raw_img.shape[0]),
+            int(0.32 * raw_img.shape[1]) : int(0.68 * raw_img.shape[1]),
+        ]
         ventricle_dark_frac = float(np.mean(central_box < 0.28))
         brain_area_frac = float(np.mean(fg_mask))
 
-        if "False Negative" in err_type:
-            if rec.slice_index < 10 or rec.slice_index > 32 or brain_area_frac < 0.42:
-                trigger = (
-                    "Peripheral slice selection + partial-volume effect: smaller ventricular "
-                    "cross-section masks medial temporal atrophy."
-                )
-            else:
-                trigger = (
-                    "Early/borderline AD phenotype: preserved global cortical ribbon thickness "
-                    "with subtle focal peri-ventricular widening near decision boundary."
-                )
-        else:
-            if ventricle_dark_frac > 0.25:
-                trigger = (
-                    "Benign age-related ventriculomegaly / prominent central CSF space in a "
-                    "healthy elderly NC control mimics AD hydrocephalus ex vacuo."
-                )
-            else:
-                trigger = (
-                    "Asymmetric sulcal widening & RF coil intensity gradient along lateral "
-                    "cortex triggers false positive atrophy activation."
-                )
+        s_indices = scan_slice_indices[rec.patient_id]
+        s_min, s_max = min(s_indices), max(s_indices)
+        rel_slice_pos = float((rec.slice_index - s_min) / max(1, s_max - s_min))
+        scan_mean_p_ad = float(np.mean(scan_ad_probs[rec.patient_id]))
+        scan_pred_label = 1 if scan_mean_p_ad >= 0.5 else 0
+        rescued_by_scan_vote = bool(scan_pred_label == rec.label)
+
+        plane_zone = (
+            "lateral parasagittal boundary"
+            if (rel_slice_pos <= 0.20 or rel_slice_pos >= 0.80)
+            else "mid-sagittal / medial temporal plane"
+        )
+        rescue_note = (
+            f"20-slice scan mean p(AD)={scan_mean_p_ad:.2f} RESCUES this slice error at scan level."
+            if rescued_by_scan_vote
+            else f"20-slice scan mean p(AD)={scan_mean_p_ad:.2f} also misclassifies the full scan."
+        )
+        trigger = (
+            f"Slice {rec.slice_index} in [{s_min}..{s_max}] (rel_pos={rel_slice_pos:.2f}, {plane_zone}); "
+            f"foreground={brain_area_frac:.2f}, central dark-CSF ratio={ventricle_dark_frac:.2f}, "
+            f"Stage-3 (6×6) Grad-CAM peak=({int(peak_r)},{int(peak_c)}). {rescue_note}"
+        )
 
         # Panel 1: Raw T1 Slice
         axes[row, 0].imshow(raw_img, cmap="gray", vmin=0.0, vmax=1.0)
         axes[row, 0].set_title(
-            f"Case #{row + 1}: {err_type}\nPatient {rec.patient_id} | Slice {rec.slice_index}",
-            fontsize=9.5,
+            f"Case #{row + 1}: {err_type}\nScan {rec.patient_id} ({rec.subject_id}) | Slice {rec.slice_index}",
+            fontsize=9.0,
             fontweight="bold",
             color="#d62728",
         )
@@ -329,24 +340,24 @@ def conduct_failure_case_autopsy(
         axes[row, 1].imshow(raw_img, cmap="gray", vmin=0.0, vmax=1.0)
         im_cam = axes[row, 1].imshow(cam_np, cmap="inferno", alpha=0.45 * fg_mask)
         axes[row, 1].set_title(
-            f"Grad-CAM Focus (Pred: {IDX_TO_LABEL[int(y_pred[ds_idx])]})\n"
-            f"Central CSF Dark Ratio: {ventricle_dark_frac:.2f}",
-            fontsize=9.5,
+            f"Stage-3 (6×6) Grad-CAM (Pred: {IDX_TO_LABEL[int(y_pred[ds_idx])]})\n"
+            f"Central Dark CSF: {ventricle_dark_frac:.2f} | Scan p(AD): {scan_mean_p_ad:.2f}",
+            fontsize=9.0,
             fontweight="bold",
         )
         axes[row, 1].axis("off")
         fig.colorbar(im_cam, ax=axes[row, 1], fraction=0.046, pad=0.04)
 
-        # Panel 3: Horizontal Mid-Brain Intensity Profile (Ventricular vs Cortical Contrast)
+        # Panel 3: Horizontal Mid-Sagittal Intensity Profile (Anterior-Posterior Contrast)
         mid_y = raw_img.shape[0] // 2
         profile = raw_img[mid_y, :]
         cam_prof = cam_np[mid_y, :]
         x_coords = np.arange(len(profile))
-        axes[row, 2].plot(x_coords, profile, color="#1f77b4", lw=2.0, label="T1 Intensity (Mid-Axial)")
+        axes[row, 2].plot(x_coords, profile, color="#1f77b4", lw=2.0, label="T1 Intensity (Mid-Sagittal)")
         axes[row, 2].fill_between(x_coords, 0, cam_prof, color="#ff7f0e", alpha=0.30, label="Grad-CAM Salience")
         axes[row, 2].set_ylim(0.0, 1.05)
-        axes[row, 2].set_title("Mid-Brain Ventricular Profile & Salience", fontsize=9.5, fontweight="bold")
-        axes[row, 2].set_xlabel("Left-to-Right Spatial Coordinate (px)")
+        axes[row, 2].set_title("Mid-Sagittal Intensity Profile & Salience", fontsize=9.5, fontweight="bold")
+        axes[row, 2].set_xlabel("Anterior-Posterior Spatial Coordinate (px)")
         axes[row, 2].set_ylabel("Normalized Value")
         axes[row, 2].grid(True, linestyle="--", alpha=0.35)
         axes[row, 2].legend(fontsize=7.8, loc="upper right")
@@ -368,7 +379,7 @@ def conduct_failure_case_autopsy(
             color="#2ca02c",
             linestyle="--",
             lw=2.0,
-            label=f"Triage Gate τ*={triage_tau:.2f}",
+            label=f"Val-Selected τ*={triage_tau:.2f}",
         )
         for b, v in zip(bars, bars_vals):
             axes[row, 3].text(
@@ -383,9 +394,9 @@ def conduct_failure_case_autopsy(
         axes[row, 3].set_xticks(x_pos)
         axes[row, 3].set_xticklabels(bars_labels, fontsize=8.0)
         axes[row, 3].set_ylim(0.0, 1.08)
-        status_str = "INTERCEPTED -> HUMAN REVIEW" if routed_to_human else "UNFLAGGED HIGH-CONF ERROR"
+        status_str = "INTERCEPTED (< τ*) -> HUMAN REVIEW" if routed_to_human else "ESCAPED GATE (≥ τ*) -> HIGH-CONF ERROR"
         status_col = "#2ca02c" if routed_to_human else "#d62728"
-        axes[row, 3].set_title(f"Triage Verdict: {status_str}", fontsize=9.2, fontweight="bold", color=status_col)
+        axes[row, 3].set_title(f"Triage Verdict: {status_str}", fontsize=8.8, fontweight="bold", color=status_col)
         axes[row, 3].grid(True, axis="y", linestyle="--", alpha=0.35)
         axes[row, 3].legend(fontsize=7.8, loc="lower right")
 
@@ -395,7 +406,10 @@ def conduct_failure_case_autopsy(
                 "error_type": err_type,
                 "dataset_index": int(ds_idx),
                 "patient_id": rec.patient_id,
+                "subject_id": rec.subject_id,
                 "slice_index": int(rec.slice_index),
+                "scan_slice_range": [int(s_min), int(s_max)],
+                "relative_slice_position": round(rel_slice_pos, 4),
                 "ground_truth": rec.class_name,
                 "predicted_class": IDX_TO_LABEL[int(y_pred[ds_idx])],
                 "raw_confidence": round(c_raw, 4),
@@ -404,14 +418,19 @@ def conduct_failure_case_autopsy(
                 "baseline_confidence": round(float(np.max(baseline_probs[ds_idx])), 4)
                 if baseline_probs is not None
                 else None,
+                "brain_foreground_fraction": round(brain_area_frac, 4),
+                "central_csf_dark_fraction": round(ventricle_dark_frac, 4),
+                "gradcam_stage2_peak_rc": [int(peak_r), int(peak_c)],
+                "scan_20slice_mean_prob_ad": round(scan_mean_p_ad, 4),
+                "rescued_by_20slice_scan_vote": rescued_by_scan_vote,
                 "intercepted_by_triage_gate": bool(routed_to_human),
                 "anatomical_diagnosis": trigger,
             }
         )
 
     fig.suptitle(
-        "Clinical Failure Case Autopsy: Diagnosing False Negatives & False Positives on ADNI Test Scans",
-        fontsize=13,
+        "Clinical Failure Case Autopsy: Intercepted Borderline Errors (< τ*) vs. High-Confidence Escaped Errors (≥ τ*)",
+        fontsize=12.5,
         fontweight="bold",
         y=1.01,
     )
@@ -422,20 +441,68 @@ def conduct_failure_case_autopsy(
     return autopsy_records
 
 
-def plot_architecture_diagram(out_path: Path) -> None:
-    """Generate a clean visual block diagram of the Uncertainty-Aware ConvNeXt Triage Pipeline."""
+def plot_architecture_diagram(out_path: Path, triage_tau: float = 0.75) -> None:
+    """Generate a clean visual block diagram matching the exact 96x96 ConvNeXt implementation."""
     fig, ax = plt.subplots(figsize=(15, 4.2), dpi=180)
     ax.set_xlim(0, 15)
     ax.set_ylim(0, 4.2)
     ax.axis("off")
 
     boxes = [
-        (0.3, 1.1, 2.0, 2.0, "#e8f4f8", "#1f77b4", "1. T1 Brain MRI\nInput Slice\n[B, 1, 128, 128]\n\nPer-Slice Z-Score\nPatient-Level Split"),
-        (2.7, 1.1, 2.1, 2.0, "#eef7ee", "#2ca02c", "2. Patchify Stem\n& Stage 1-2\n\n4×4 Conv Stem\nLayerNorm2d\nC = [48, 96]"),
-        (5.2, 1.1, 2.5, 2.0, "#fff4e6", "#ff7f0e", "3. ConvNeXt Blocks\nStage 3-4 [Hard]\n\n7×7 Depthwise Conv\n1×1 Inverted MLP (4×)\nGELU + LayerScale γ\nDropPath (p=0.15)"),
-        (8.1, 1.1, 2.1, 2.0, "#f3eaf8", "#9467bd", "4. Global Pool &\nTemp Calibration\n\nGAP + LayerNorm\nLogits z / T*\nShannon Entropy H(p)"),
-        (10.6, 2.2, 4.0, 1.2, "#e6f5ea", "#2ca02c", "High Confidence (max p ≥ τ* = 0.80)\n→ AUTO-DIAGNOSE (AD / NC)"),
-        (10.6, 0.6, 4.0, 1.2, "#fdeaea", "#d62728", "Ambiguous Boundary (max p < τ* = 0.80)\n→ ROUTE TO NEURORADIOLOGIST"),
+        (
+            0.3,
+            1.1,
+            2.0,
+            2.0,
+            "#e8f4f8",
+            "#1f77b4",
+            "1. Sagittal T1 MRI\nInput Slice\n[B, 1, 96, 96]\n\nTight Brain ROI Crop\nCohort Norm (0.18, 0.25)",
+        ),
+        (
+            2.7,
+            1.1,
+            2.1,
+            2.0,
+            "#eef7ee",
+            "#2ca02c",
+            "2. Patchify Stem\n& Stage 1–2\n\n4×4 Conv Stem (24×24)\nLayerNorm2d\nC=[32, 64] (24×24→12×12)",
+        ),
+        (
+            5.2,
+            1.1,
+            2.5,
+            2.0,
+            "#fff4e6",
+            "#ff7f0e",
+            "3. ConvNeXt Blocks\nStage 3–4 [Hard]\n\n7×7 Depthwise Conv\n1×1 Inverted MLP (4×)\nC=[128, 256] (6×6→3×3)\nDropPath (p=0.10)",
+        ),
+        (
+            8.1,
+            1.1,
+            2.1,
+            2.0,
+            "#f3eaf8",
+            "#9467bd",
+            "4. Calibration &\nStage-3 Grad-CAM\n\n6×6 Spatial Attribution\nLogits z / T*\nVal-Selected Gate τ*",
+        ),
+        (
+            10.6,
+            2.2,
+            4.0,
+            1.2,
+            "#e6f5ea",
+            "#2ca02c",
+            f"High Confidence (max p ≥ τ* = {triage_tau:.2f})\n→ AUTO-CLEAR (Slice & 20-Slice Scan)",
+        ),
+        (
+            10.6,
+            0.6,
+            4.0,
+            1.2,
+            "#fdeaea",
+            "#d62728",
+            f"Ambiguous Boundary (max p < τ* = {triage_tau:.2f})\n→ ROUTE TO NEURORADIOLOGIST",
+        ),
     ]
 
     for x, y, w, h, fc, ec, text in boxes:
@@ -447,7 +514,7 @@ def plot_architecture_diagram(out_path: Path) -> None:
             text,
             ha="center",
             va="center",
-            fontsize=8.8,
+            fontsize=8.6,
             fontweight="bold",
             color="#1a1a1a",
             zorder=3,
@@ -470,7 +537,7 @@ def plot_architecture_diagram(out_path: Path) -> None:
         )
 
     ax.set_title(
-        "System Architecture: Modernized ConvNeXt Backbone with Calibrated Reject-Option Clinical Triage",
+        "System Architecture: Modernized 96×96 ConvNeXt Backbone (2.18M Params) with Calibrated Selective Triage",
         fontsize=12.5,
         fontweight="bold",
         pad=10,
@@ -505,7 +572,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional path to saved SimpleCNNBaseline checkpoint.",
     )
-    parser.add_argument("--triage_threshold", type=float, default=0.80, help="Confidence gate tau*.")
+    parser.add_argument(
+        "--triage_threshold",
+        type=float,
+        default=None,
+        help="Confidence gate tau* (defaults to validation-selected tau* stored in checkpoint).",
+    )
     parser.add_argument("--batch_size", type=int, default=128, help="Evaluation batch size.")
     parser.add_argument("--device", type=str, default="auto", help="Compute device.")
     return parser.parse_args()
@@ -522,6 +594,13 @@ def main() -> None:
 
     ckpt_path = Path(args.checkpoint) if args.checkpoint else CHECKPOINTS_DIR / "convnext_best.pt"
     model, temperature, image_size = load_trained_model("convnext", ckpt_path, device)
+    ckpt_payload = torch.load(ckpt_path, map_location=device, weights_only=False)
+    use_cal_for_triage = bool(ckpt_payload.get("use_calibrated_for_triage", True))
+    triage_tau = (
+        float(args.triage_threshold)
+        if args.triage_threshold is not None
+        else float(ckpt_payload.get("val_selected_tau", 0.75))
+    )
 
     _, _, test_loader, audit = build_adni_dataloaders(
         data_root=args.data_root,
@@ -534,42 +613,54 @@ def main() -> None:
 
     test_logits, test_labels, test_metas = collect_logits_and_labels(model, test_loader, device)
     metrics = compute_comprehensive_metrics(
-        test_logits, test_labels, temperature=temperature, metas=test_metas
+        test_logits,
+        test_labels,
+        temperature=temperature,
+        metas=test_metas,
+        use_calibrated_for_triage=use_cal_for_triage,
+        selected_tau=triage_tau,
     )
 
     baseline_probs: Optional[np.ndarray] = None
     base_ckpt = Path(args.baseline_checkpoint) if args.baseline_checkpoint else CHECKPOINTS_DIR / "baseline_best.pt"
     if base_ckpt.exists():
         b_model, b_temp, _ = load_trained_model("baseline", base_ckpt, device)
+        b_payload = torch.load(base_ckpt, map_location=device, weights_only=False)
+        b_use_cal = bool(b_payload.get("use_calibrated_for_triage", True))
         b_logits, _, _ = collect_logits_and_labels(b_model, test_loader, device)
-        baseline_probs = F.softmax(b_logits / b_temp, dim=-1).numpy()
+        baseline_probs = F.softmax(b_logits / (b_temp if b_use_cal else 1.0), dim=-1).numpy()
 
     print("\n======================================================================")
-    print("   ADNI BRAIN MRI CLASSIFICATION — CONVNEXT TEST INFERENCE REPORT")
+    print(f"   ADNI BRAIN MRI CLASSIFICATION — CONVNEXT TEST INFERENCE ({args.split_mode.upper()})")
     print("======================================================================")
     print(f"Dataset Root        : {audit['resolved_root']}")
-    print(f"Held-Out Test Split : {audit['test']['total_slices']} slices ({audit['test']['total_patients']} patients)")
-    print(f"Slice-Level Accuracy: {metrics['accuracy'] * 100:.2f}% (Target >= 80.00%)")
-    print(f"Patient-Level Acc   : {metrics['patient_level'].get('patient_accuracy', 0.0) * 100:.2f}%")
+    print(
+        f"Held-Out Test Split : {audit['test']['total_slices']} slices "
+        f"({audit['test']['total_patients']} scans, {audit['test']['total_subjects']} subjects)"
+    )
+    print(f"Slice-Level Accuracy: {metrics['accuracy'] * 100:.2f}%")
+    print(f"Scan Mean-Prob Acc  : {metrics['patient_level'].get('scan_mean_prob_accuracy', 0.0) * 100:.2f}%")
+    print(f"Scan Majority-Vote  : {metrics['patient_level'].get('scan_majority_vote_accuracy', 0.0) * 100:.2f}%")
+    print(f"Subject-Level Acc   : {metrics['patient_level'].get('subject_accuracy', 0.0) * 100:.2f}%")
     print(f"Macro-F1 / AUROC    : {metrics['macro_f1']:.4f} / {metrics['auroc']:.4f} (PR-AUC: {metrics['pr_auc']:.4f})")
     print(f"NC Precision/Recall : {metrics['per_class']['NC']['precision']:.4f} / {metrics['per_class']['NC']['recall']:.4f}")
     print(f"AD Precision/Recall : {metrics['per_class']['AD']['precision']:.4f} / {metrics['per_class']['AD']['recall']:.4f}")
     print(f"Optimal Temp (T*)   : {temperature:.4f} (ECE: {metrics['ece_uncalibrated']:.4f} -> {metrics['ece_calibrated']:.4f})")
 
-    # Find operating point matching args.triage_threshold
     tau_entry = min(
         metrics["triage_sweep"],
-        key=lambda e: abs(e["threshold"] - args.triage_threshold),
+        key=lambda e: abs(e["threshold"] - triage_tau),
     )
-    print("\n--- Recommended Clinical Triage Operating Policy ---")
-    print(f"Confidence Gate τ*  : {tau_entry['threshold']:.2f}")
-    print(f"Automated Coverage  : {tau_entry['coverage'] * 100:.1f}% of incoming scans auto-diagnosed")
+    print("\n--- Validation-Selected Clinical Triage Operating Policy ---")
+    print(f"Confidence Gate τ*  : {tau_entry['threshold']:.2f} (selected strictly on validation split)")
+    print(f"Automated Coverage  : {tau_entry['coverage'] * 100:.1f}% of incoming slices auto-cleared")
     print(f"Specialist Referral : {tau_entry['referral_rate'] * 100:.1f}% routed to human neuroradiologist")
-    print(f"Auto-Diagnosed Acc  : {tau_entry['accepted_accuracy'] * 100:.2f}%")
-    print(f"Hybrid System Acc   : {tau_entry['system_hybrid_accuracy'] * 100:.2f}%")
+    print(f"Auto-Cleared Acc    : {tau_entry['accepted_accuracy'] * 100:.2f}%")
+    print(f"Intercepted FN Rate : {tau_entry.get('intercepted_fn_fraction', 0.0) * 100:.1f}% of false negatives caught")
+    print(f"Oracle Hybrid Acc   : {tau_entry['system_hybrid_accuracy'] * 100:.2f}% (assuming 100% specialist accuracy on referrals)")
 
     IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-    plot_architecture_diagram(IMAGES_DIR / "convnext_architecture.png")
+    plot_architecture_diagram(IMAGES_DIR / "convnext_architecture.png", triage_tau=triage_tau)
     plot_preprocessing_showcase(test_ds, IMAGES_DIR / "preprocessing_and_samples.png")
 
     cal_probs = F.softmax(test_logits / temperature, dim=-1).numpy()
@@ -580,7 +671,7 @@ def main() -> None:
         temperature=temperature,
         device=device,
         out_path=IMAGES_DIR / "sample_predictions.png",
-        triage_tau=args.triage_threshold,
+        triage_tau=triage_tau,
     )
 
     autopsy_cases = conduct_failure_case_autopsy(
@@ -591,23 +682,29 @@ def main() -> None:
         baseline_probs=baseline_probs,
         device=device,
         out_path=IMAGES_DIR / "failure_autopsy.png",
-        triage_tau=args.triage_threshold,
+        triage_tau=triage_tau,
     )
 
     CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
     with open(CHECKPOINTS_DIR / "failure_autopsy_cases.json", "w", encoding="utf-8") as f:
         json.dump(autopsy_cases, f, indent=2)
 
+    results_dir = Path(__file__).resolve().parent / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    with open(results_dir / f"failure_autopsy_{args.split_mode}.json", "w", encoding="utf-8") as f:
+        json.dump(autopsy_cases, f, indent=2)
+
     print("\n--- 4-Case Failure Autopsy Summary ---")
     for c in autopsy_cases:
         print(
-            f"  Case #{c['case_number']} [{c['error_type']}] Patient={c['patient_id']} Slice={c['slice_index']} | "
+            f"  Case #{c['case_number']} [{c['error_type']}] Scan={c['patient_id']} ({c['subject_id']}) Slice={c['slice_index']} | "
             f"CalConf={c['calibrated_confidence']:.3f} | Entropy={c['predictive_entropy']:.3f} | "
-            f"Intercepted={c['intercepted_by_triage_gate']}\n"
-            f"    -> Root Trigger: {c['anatomical_diagnosis']}"
+            f"Intercepted={c['intercepted_by_triage_gate']} | RescuedByScanVote={c['rescued_by_20slice_scan_vote']}\n"
+            f"    -> Telemetry: {c['anatomical_diagnosis']}"
         )
     print(f"\nVisualizations written to: {IMAGES_DIR}")
 
 
 if __name__ == "__main__":
     main()
+

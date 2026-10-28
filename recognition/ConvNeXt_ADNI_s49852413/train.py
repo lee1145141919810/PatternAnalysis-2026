@@ -50,6 +50,7 @@ from modules import TemperatureScaledClassifier, build_model, count_parameters
 PROJECT_DIR = Path(__file__).resolve().parent
 IMAGES_DIR = PROJECT_DIR / "images"
 CHECKPOINTS_DIR = PROJECT_DIR / "checkpoints"
+RESULTS_DIR = PROJECT_DIR / "results"
 
 
 def set_global_seed(seed: int = 42) -> None:
@@ -73,13 +74,25 @@ def select_device(requested: str = "auto") -> torch.device:
     return torch.device(req)
 
 
-def get_peak_memory_mb(device: torch.device) -> float:
-    """Measure peak allocated GPU/MPS memory in Megabytes (MB)."""
+def reset_memory_stats(device: torch.device) -> None:
+    """Reset peak memory counters or empty cache prior to profiling a model."""
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+    elif device.type == "mps" and hasattr(torch, "mps"):
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+
+
+def get_current_memory_mb(device: torch.device) -> float:
+    """Measure currently allocated tensor memory in Megabytes (MB)."""
     if device.type == "cuda":
         return float(torch.cuda.max_memory_allocated(device) / (1024.0 ** 2))
     if device.type == "mps" and hasattr(torch, "mps"):
         try:
-            return float(torch.mps.driver_allocated_memory() / (1024.0 ** 2))
+            return float(torch.mps.current_allocated_memory() / (1024.0 ** 2))
         except Exception:
             return 0.0
     return 0.0
@@ -139,8 +152,12 @@ def evaluate_selective_triage(
 ) -> List[Dict[str, float]]:
     """Evaluate reject-option triage metrics across confidence thresholds tau.
 
-    Slices with `max_c p_hat_c >= tau` are automatically diagnosed by the model;
-    ambiguous slices with `max_c p_hat_c < tau` are routed to a human specialist.
+    Items (slices or 3D scans) with `max_c p_hat_c >= tau` are automatically cleared by the model;
+    ambiguous items with `max_c p_hat_c < tau` are routed to a human specialist.
+
+    Note on `system_hybrid_accuracy`: Assumes an oracle human specialist (100% accuracy on referred
+    cases) as an upper-bound reference; primary evaluation relies on `accepted_accuracy`, `coverage`,
+    and `intercepted_fn_fraction` (the fraction of baseline False Negatives caught by the triage gate).
     """
     if thresholds is None:
         thresholds = [round(t, 2) for t in np.arange(0.50, 0.96, 0.05)]
@@ -149,6 +166,7 @@ def evaluate_selective_triage(
     preds = np.argmax(probs, axis=1)
     n_total = len(labels)
     total_ad = max(1, int(np.sum(labels == 1)))
+    total_baseline_fn = int(np.sum((labels == 1) & (preds == 0)))
 
     results: List[Dict[str, float]] = []
     for tau in thresholds:
@@ -159,18 +177,24 @@ def evaluate_selective_triage(
 
         if n_acc > 0:
             acc_accepted = float(np.mean(preds[accepted] == labels[accepted]))
-            # False negatives among accepted predictions (missed AD cases that were NOT referred)
+            # False negatives among accepted predictions (missed AD cases that escaped the triage gate)
             fn_accepted = int(np.sum((labels == 1) & accepted & (preds == 0)))
             ad_accepted = int(np.sum((labels == 1) & accepted))
             fn_rate_accepted = fn_accepted / max(1, ad_accepted) if ad_accepted > 0 else 0.0
             unflagged_missed_ad_fraction = fn_accepted / total_ad
-            # System-level accuracy when human specialist resolves referred ambiguous cases
+            intercepted_fn_fraction = (
+                (total_baseline_fn - fn_accepted) / total_baseline_fn
+                if total_baseline_fn > 0
+                else 1.0
+            )
+            # Upper-bound hybrid accuracy assuming human specialist resolves referred ambiguous cases
             system_correct = int(np.sum(preds[accepted] == labels[accepted])) + (n_total - n_acc)
             system_acc = system_correct / max(1, n_total)
         else:
             acc_accepted = 1.0
             fn_rate_accepted = 0.0
             unflagged_missed_ad_fraction = 0.0
+            intercepted_fn_fraction = 1.0
             system_acc = 1.0
 
         results.append(
@@ -181,10 +205,45 @@ def evaluate_selective_triage(
                 "accepted_accuracy": float(acc_accepted),
                 "accepted_fn_rate": float(fn_rate_accepted),
                 "unflagged_missed_ad_fraction": float(unflagged_missed_ad_fraction),
+                "intercepted_fn_fraction": float(intercepted_fn_fraction),
                 "system_hybrid_accuracy": float(system_acc),
             }
         )
     return results
+
+
+def select_validation_triage_threshold(
+    val_triage_sweep: List[Dict[str, float]],
+    min_fn_interception: float = 0.60,
+    min_coverage: float = 0.25,
+) -> float:
+    """Select the operating confidence threshold tau* strictly on the validation set.
+
+    Chooses the lowest threshold tau > 0.50 that intercepts at least `min_fn_interception` (60%)
+    of validation False Negatives while maintaining at least `min_coverage` automated coverage.
+    If no threshold satisfies both constraints simultaneously, picks the threshold maximizing
+    `accepted_accuracy * sqrt(coverage) + 0.5 * intercepted_fn_fraction`.
+    """
+    candidates = [
+        entry
+        for entry in val_triage_sweep
+        if entry["threshold"] > 0.50
+        and entry["intercepted_fn_fraction"] >= min_fn_interception
+        and entry["coverage"] >= min_coverage
+    ]
+    if candidates:
+        # Pick the candidate with highest coverage (lowest tau meeting safety target)
+        best = max(candidates, key=lambda e: (e["coverage"], e["accepted_accuracy"]))
+        return float(best["threshold"])
+
+    non_trivial = [e for e in val_triage_sweep if e["threshold"] > 0.50 and e["coverage"] >= 0.15]
+    if not non_trivial:
+        return 0.75
+    best = max(
+        non_trivial,
+        key=lambda e: e["accepted_accuracy"] * math.sqrt(e["coverage"]) + 0.5 * e["intercepted_fn_fraction"],
+    )
+    return float(best["threshold"])
 
 
 @torch.no_grad()
@@ -202,7 +261,6 @@ def collect_logits_and_labels(
     for batch in loader:
         if len(batch) == 3:
             images, labels, meta_batch = batch
-            # Unpack collated metadata dict of lists into list of dicts
             bsz = images.shape[0]
             for i in range(bsz):
                 all_metas.append({k: (v[i].item() if isinstance(v[i], torch.Tensor) else v[i]) for k, v in meta_batch.items()})
@@ -222,14 +280,17 @@ def compute_comprehensive_metrics(
     labels: torch.Tensor,
     temperature: float = 1.0,
     metas: Optional[List[Dict[str, object]]] = None,
+    use_calibrated_for_triage: bool = True,
+    selected_tau: Optional[float] = None,
 ) -> Dict[str, object]:
-    """Compute slice-level, patient-level, calibration, and selective triage metrics."""
+    """Compute slice-level, scan-level, subject-level, calibration, and selective triage metrics."""
     y_true = labels.numpy().astype(np.int64)
     raw_probs = F.softmax(raw_logits, dim=-1).numpy()
     cal_probs = F.softmax(raw_logits / temperature, dim=-1).numpy()
 
-    y_pred = np.argmax(cal_probs, axis=1)
-    y_score_ad = cal_probs[:, 1]
+    active_probs = cal_probs if use_calibrated_for_triage else raw_probs
+    y_pred = np.argmax(active_probs, axis=1)
+    y_score_ad = active_probs[:, 1]
 
     acc = float(accuracy_score(y_true, y_pred))
     bal_acc = float(balanced_accuracy_score(y_true, y_pred))
@@ -255,34 +316,79 @@ def compute_comprehensive_metrics(
     # Normalized binary Shannon entropy
     eps = 1e-8
     entropy_cal = -(
-        cal_probs[:, 0] * np.log(np.clip(cal_probs[:, 0], eps, 1.0))
-        + cal_probs[:, 1] * np.log(np.clip(cal_probs[:, 1], eps, 1.0))
+        active_probs[:, 0] * np.log(np.clip(active_probs[:, 0], eps, 1.0))
+        + active_probs[:, 1] * np.log(np.clip(active_probs[:, 1], eps, 1.0))
     ) / math.log(2.0)
 
-    # Patient-level aggregation (averaging slice probabilities per patient scan)
-    patient_metrics: Dict[str, float] = {}
+    # Scan-level (20 slices per 3D scan) and human Subject-level aggregation
+    patient_metrics: Dict[str, object] = {}
+    scan_triage_sweep: List[Dict[str, float]] = []
     if metas:
         pid_probs: Dict[str, List[float]] = defaultdict(list)
+        pid_votes: Dict[str, List[int]] = defaultdict(list)
         pid_labels: Dict[str, int] = {}
+        subj_probs: Dict[str, List[float]] = defaultdict(list)
+        subj_labels: Dict[str, int] = {}
+
         for i, m in enumerate(metas):
             pid = str(m["patient_id"])
+            sid = str(m.get("subject_id", pid))
             pid_probs[pid].append(float(y_score_ad[i]))
+            pid_votes[pid].append(int(y_pred[i]))
             pid_labels[pid] = int(y_true[i])
-        p_true = np.array([pid_labels[p] for p in sorted(pid_probs.keys())])
-        p_score = np.array([np.mean(pid_probs[p]) for p in sorted(pid_probs.keys())])
-        p_pred = (p_score >= 0.5).astype(np.int64)
+            subj_probs[sid].append(float(y_score_ad[i]))
+            subj_labels[sid] = int(y_true[i])
+
+        sorted_pids = sorted(pid_probs.keys())
+        p_true = np.array([pid_labels[p] for p in sorted_pids], dtype=np.int64)
+        p_score = np.array([np.mean(pid_probs[p]) for p in sorted_pids], dtype=np.float64)
+        p_pred_prob = (p_score >= 0.5).astype(np.int64)
+        p_pred_vote = np.array([1 if np.mean(pid_votes[p]) >= 0.5 else 0 for p in sorted_pids], dtype=np.int64)
+
+        scan_prob_matrix = np.stack([1.0 - p_score, p_score], axis=1)
+        scan_triage_sweep = evaluate_selective_triage(scan_prob_matrix, p_true)
+
+        sorted_sids = sorted(subj_probs.keys())
+        s_true = np.array([subj_labels[s] for s in sorted_sids], dtype=np.int64)
+        s_score = np.array([np.mean(subj_probs[s]) for s in sorted_sids], dtype=np.float64)
+        s_pred = (s_score >= 0.5).astype(np.int64)
+
+        rng_boot = np.random.default_rng(42)
+        p_correct = (p_true == p_pred_prob).astype(np.float64)
+        p_boots = [float(np.mean(rng_boot.choice(p_correct, size=len(p_correct), replace=True))) for _ in range(1000)]
+        s_correct = (s_true == s_pred).astype(np.float64)
+        s_boots = [float(np.mean(rng_boot.choice(s_correct, size=len(s_correct), replace=True))) for _ in range(1000)]
+
         patient_metrics = {
-            "patient_accuracy": float(accuracy_score(p_true, p_pred)),
-            "patient_macro_f1": float(f1_score(p_true, p_pred, average="macro", zero_division=0)),
+            "patient_accuracy": float(accuracy_score(p_true, p_pred_prob)),
+            "scan_mean_prob_accuracy": float(accuracy_score(p_true, p_pred_prob)),
+            "scan_majority_vote_accuracy": float(accuracy_score(p_true, p_pred_vote)),
+            "scan_acc_ci95": [round(float(np.percentile(p_boots, 2.5)), 4), round(float(np.percentile(p_boots, 97.5)), 4)],
+            "patient_macro_f1": float(f1_score(p_true, p_pred_prob, average="macro", zero_division=0)),
             "patient_auroc": float(roc_auc_score(p_true, p_score)),
             "num_patients": int(len(p_true)),
+            "subject_accuracy": float(accuracy_score(s_true, s_pred)),
+            "subject_acc_ci95": [round(float(np.percentile(s_boots, 2.5)), 4), round(float(np.percentile(s_boots, 97.5)), 4)],
+            "subject_macro_f1": float(f1_score(s_true, s_pred, average="macro", zero_division=0)),
+            "subject_auroc": float(roc_auc_score(s_true, s_score)) if len(np.unique(s_true)) > 1 else 0.0,
+            "num_subjects": int(len(s_true)),
         }
 
     # ROC and PR curves for plotting
     fpr, tpr, _ = roc_curve(y_true, y_score_ad)
     pr_p, pr_r, _ = precision_recall_curve(y_true, y_score_ad)
 
-    triage_sweep = evaluate_selective_triage(cal_probs, y_true)
+    triage_sweep = evaluate_selective_triage(active_probs, y_true)
+    tau_eval = selected_tau if selected_tau is not None else select_validation_triage_threshold(triage_sweep)
+    operating_point_slice = next(
+        (e for e in triage_sweep if abs(e["threshold"] - tau_eval) < 1e-4),
+        triage_sweep[0],
+    )
+    operating_point_scan = (
+        next((e for e in scan_triage_sweep if abs(e["threshold"] - tau_eval) < 1e-4), scan_triage_sweep[0])
+        if scan_triage_sweep
+        else {}
+    )
 
     return {
         "accuracy": acc,
@@ -304,6 +410,10 @@ def compute_comprehensive_metrics(
         },
         "confusion_matrix": cm,
         "temperature": float(temperature),
+        "triage_prob_source": "temperature_scaled" if use_calibrated_for_triage else "uncalibrated_raw_fallback",
+        "selected_tau": float(tau_eval),
+        "operating_point_slice": operating_point_slice,
+        "operating_point_scan": operating_point_scan,
         "ece_uncalibrated": ece_raw,
         "ece_calibrated": ece_cal,
         "brier_uncalibrated": brier_raw,
@@ -318,6 +428,7 @@ def compute_comprehensive_metrics(
         "reliability_raw": rel_raw,
         "reliability_calibrated": rel_cal,
         "triage_sweep": triage_sweep,
+        "scan_triage_sweep": scan_triage_sweep,
         "curves": {
             "fpr": [float(x) for x in fpr],
             "tpr": [float(x) for x in tpr],
@@ -336,11 +447,11 @@ def compute_comprehensive_metrics(
 def profile_inference_latency(
     model: nn.Module,
     device: torch.device,
-    image_size: int = 128,
-    batch_size: int = 32,
+    image_size: int = 96,
+    batch_size: int = 128,
     num_iters: int = 30,
 ) -> Dict[str, float]:
-    """Profile single-slice latency (ms) and batched throughput (slices/sec)."""
+    """Profile single-slice latency (ms) and batched throughput (slices/sec) at `batch_size=128`."""
     model.eval()
     x_single = torch.randn(1, 1, image_size, image_size, device=device)
     x_batch = torch.randn(batch_size, 1, image_size, image_size, device=device)
@@ -378,6 +489,7 @@ def profile_inference_latency(
     batch_per_slice_ms = 1000.0 / max(throughput_fps, 1e-6)
 
     return {
+        "latency_batch_size": int(batch_size),
         "single_slice_latency_ms": float(single_ms),
         "batched_per_slice_latency_ms": float(batch_per_slice_ms),
         "throughput_slices_per_sec": float(throughput_fps),
@@ -390,25 +502,24 @@ def train_single_model(
     val_loader: torch.utils.data.DataLoader,
     test_loader: torch.utils.data.DataLoader,
     device: torch.device,
-    epochs: int = 20,
-    lr: float = 8e-4,
+    epochs: int = 12,
+    lr: float = 1.2e-3,
     weight_decay: float = 1e-2,
-    image_size: int = 128,
+    image_size: int = 96,
     seed: int = 42,
 ) -> Dict[str, object]:
-    """Train, validate, calibrate, and benchmark a single model architecture."""
+    """Train, validate, calibrate, and benchmark a single model architecture under identical hyperparameters."""
     set_global_seed(seed)
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
+    reset_memory_stats(device)
 
     model = build_model(model_name, in_channels=1, num_classes=2).to(device)
     total_params, trainable_params = count_parameters(model)
 
-    is_convnext = "convnext" in model_name.lower()
+    # Identical optimizer and weight_decay across both SimpleCNNBaseline and ConvNeXt
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=lr,
-        weight_decay=weight_decay if is_convnext else 1e-4,
+        weight_decay=weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
     criterion = nn.CrossEntropyLoss()
@@ -426,8 +537,9 @@ def train_single_model(
     best_score = -1.0
     best_state: Optional[Dict[str, torch.Tensor]] = None
     best_epoch = 1
+    peak_mem_mb = get_current_memory_mb(device)
 
-    print(f"\n--- Training [{model_name.upper()}] on {device} ({total_params:,} params) ---")
+    print(f"\n--- Training [{model_name.upper()}] on {device} ({total_params:,} params, wd={weight_decay}) ---")
     total_train_start = time.perf_counter()
 
     for epoch in range(1, epochs + 1):
@@ -445,6 +557,7 @@ def train_single_model(
             logits = model(images)
             loss = criterion(logits, labels)
             loss.backward()
+            peak_mem_mb = max(peak_mem_mb, get_current_memory_mb(device))
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
             optimizer.step()
 
@@ -492,15 +605,33 @@ def train_single_model(
             )
 
     total_train_sec = time.perf_counter() - total_train_start
-    peak_mem_mb = get_peak_memory_mb(device)
+    peak_mem_mb = max(peak_mem_mb, get_current_memory_mb(device))
 
     if best_state is not None:
         model.load_state_dict(best_state)
 
     # Fit post-hoc Temperature Scaling on validation set
-    val_logits_best, val_labels_best, _ = collect_logits_and_labels(model, val_loader, device)
+    val_logits_best, val_labels_best, val_metas = collect_logits_and_labels(model, val_loader, device)
     cal_wrapper = TemperatureScaledClassifier(model, init_temperature=1.0).to(device)
     optimal_temp = cal_wrapper.fit_temperature(val_logits_best.to(device), val_labels_best.to(device))
+
+    # Check on validation set whether Temperature Scaling improves ECE; fallback to raw if it degrades
+    val_raw_probs = F.softmax(val_logits_best, dim=-1).numpy()
+    val_cal_probs = F.softmax(val_logits_best / optimal_temp, dim=-1).numpy()
+    val_ece_raw, _ = compute_ece(val_raw_probs, val_labels_best.numpy())
+    val_ece_cal, _ = compute_ece(val_cal_probs, val_labels_best.numpy())
+    use_cal_for_triage = bool(val_ece_cal <= val_ece_raw + 1e-4)
+
+    # Compute validation metrics and select operating threshold tau* STRICTLY on validation set
+    val_metrics = compute_comprehensive_metrics(
+        val_logits_best,
+        val_labels_best,
+        temperature=optimal_temp,
+        metas=val_metas,
+        use_calibrated_for_triage=use_cal_for_triage,
+        selected_tau=None,
+    )
+    val_selected_tau = float(val_metrics["selected_tau"])
 
     # Save checkpoint to git-ignored checkpoints/ directory
     CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -510,26 +641,33 @@ def train_single_model(
             "model_name": model_name,
             "best_epoch": best_epoch,
             "temperature": optimal_temp,
+            "use_calibrated_for_triage": use_cal_for_triage,
+            "val_selected_tau": val_selected_tau,
             "image_size": image_size,
             "state_dict": model.state_dict(),
         },
         ckpt_path,
     )
 
-    # Final evaluation on held-out test set
+    # Final evaluation on held-out test set using validation-selected tau*
     test_logits, test_labels, test_metas = collect_logits_and_labels(model, test_loader, device)
     test_metrics = compute_comprehensive_metrics(
-        test_logits, test_labels, temperature=optimal_temp, metas=test_metas
-    )
-    val_metrics = compute_comprehensive_metrics(
-        val_logits_best, val_labels_best, temperature=optimal_temp
+        test_logits,
+        test_labels,
+        temperature=optimal_temp,
+        metas=test_metas,
+        use_calibrated_for_triage=use_cal_for_triage,
+        selected_tau=val_selected_tau,
     )
 
-    latency_profile = profile_inference_latency(model, device=device, image_size=image_size)
+    eval_batch_size = int(getattr(train_loader, "batch_size", 128) or 128)
+    latency_profile = profile_inference_latency(
+        model, device=device, image_size=image_size, batch_size=eval_batch_size
+    )
     resource_profile = {
         "total_params": total_params,
         "trainable_params": trainable_params,
-        "peak_memory_mb": peak_mem_mb,
+        "peak_memory_mb": round(float(peak_mem_mb), 2),
         "total_train_time_sec": float(total_train_sec),
         "mean_epoch_time_sec": float(np.mean(history["epoch_time_sec"])),
         "best_epoch": best_epoch,
@@ -539,11 +677,11 @@ def train_single_model(
     print(
         f"[{model_name.upper()} TEST RESULTS] "
         f"Slice Acc={test_metrics['accuracy']:.4f} | "
-        f"Patient Acc={test_metrics['patient_level'].get('patient_accuracy', 0.0):.4f} | "
+        f"Scan Acc={test_metrics['patient_level'].get('patient_accuracy', 0.0):.4f} | "
         f"Macro-F1={test_metrics['macro_f1']:.4f} | "
         f"AUROC={test_metrics['auroc']:.4f} | "
-        f"PR-AUC={test_metrics['pr_auc']:.4f} | "
-        f"T*={optimal_temp:.3f} | "
+        f"T*={optimal_temp:.3f} ({test_metrics['triage_prob_source']}) | "
+        f"Val-Selected τ*={val_selected_tau:.2f} | "
         f"ECE: {test_metrics['ece_uncalibrated']:.4f} -> {test_metrics['ece_calibrated']:.4f}"
     )
 
@@ -557,13 +695,32 @@ def train_single_model(
     }
 
 
-def plot_training_curves(results_by_model: Dict[str, Dict[str, object]], out_path: Path) -> None:
-    """Plot training and validation loss, accuracy, and AUROC curves."""
+def plot_training_curves(
+    results_by_model: Dict[str, Dict[str, object]],
+    out_path: Path,
+    split_mode: str = "longitudinal",
+) -> None:
+    """Plot training and validation loss, accuracy, and AUROC curves with accurate split labels."""
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.8), dpi=180)
     styles = {
         "convnext": ("#1f77b4", "-", "ConvNeXt [Hard]"),
         "baseline": ("#d62728", "--", "SimpleCNN [Baseline]"),
     }
+    split_titles = {
+        "subject": (
+            "Classification Accuracy (Strict Subject-Disjoint Split)",
+            "ADNI Brain MRI Classification: Training & Validation Dynamics (Strict Subject-Disjoint, Zero Subject Overlap)",
+        ),
+        "longitudinal": (
+            "Classification Accuracy (Scan-Disjoint Longitudinal Split)",
+            "ADNI Brain MRI Classification: Training & Validation Dynamics (Within-Subject Longitudinal Split)",
+        ),
+        "official": (
+            "Classification Accuracy (Official Folder Split)",
+            "ADNI Brain MRI Classification: Training & Validation Dynamics (Official Folder Split — Protocol Confound)",
+        ),
+    }
+    panel_acc_title, suptitle_text = split_titles.get(split_mode, split_titles["longitudinal"])
 
     for m_name, res in results_by_model.items():
         hist = res["history"]
@@ -589,7 +746,7 @@ def plot_training_curves(results_by_model: Dict[str, Dict[str, object]], out_pat
     axes[0].legend(fontsize=8.5)
 
     axes[1].axhline(0.80, color="#2ca02c", linestyle="-.", lw=1.5, label="Course Target (0.80)")
-    axes[1].set_title("Classification Accuracy (Strict Patient Split)", fontsize=11, fontweight="bold")
+    axes[1].set_title(panel_acc_title, fontsize=11, fontweight="bold")
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("Accuracy")
     axes[1].set_ylim(0.50, 1.0)
@@ -605,7 +762,7 @@ def plot_training_curves(results_by_model: Dict[str, Dict[str, object]], out_pat
     axes[2].legend(fontsize=8.5, loc="lower right")
 
     fig.suptitle(
-        "ADNI Brain MRI Classification: Training & Validation Dynamics (Zero Patient Leakage)",
+        suptitle_text,
         fontsize=13,
         fontweight="bold",
         y=1.02,
@@ -699,9 +856,15 @@ def plot_roc_pr_and_confusion(results_by_model: Dict[str, Dict[str, object]], ou
 def plot_dilemma_calibration_and_triage(
     results_by_model: Dict[str, Dict[str, object]],
     out_path: Path,
-    recommended_tau: float = 0.80,
+    recommended_tau: Optional[float] = None,
 ) -> None:
     """Plot Reliability Diagram, Confidence Separation on Errors, and Selective Triage Trade-off."""
+    if recommended_tau is None:
+        if "convnext" in results_by_model:
+            recommended_tau = float(results_by_model["convnext"]["test_metrics"].get("selected_tau", 0.80))
+        else:
+            recommended_tau = 0.80
+
     fig, axes = plt.subplots(1, 3, figsize=(17, 5.0), dpi=180)
 
     # Panel 1: Reliability Diagram
@@ -782,7 +945,7 @@ def plot_dilemma_calibration_and_triage(
             color="#2ca02c",
             linestyle="--",
             lw=2.2,
-            label=f"Reject-Option Threshold τ* = {recommended_tau:.2f}",
+            label=f"Val-Selected Threshold τ* = {recommended_tau:.2f}",
         )
     axes[1].set_title("B. Confidence Separation (Correct vs. Errors)", fontsize=11, fontweight="bold")
     axes[1].set_xlabel("Calibrated Max Class Probability")
@@ -804,7 +967,7 @@ def plot_dilemma_calibration_and_triage(
         axes[2].plot(taus, acc_auto, "o-", color=color, lw=2.3, label=f"{label} Auto-Cleared Acc (%)")
         axes[2].plot(taus, covs, "s--", color=color, alpha=0.55, lw=1.6, label=f"{label} Automated Coverage (%)")
 
-    axes[2].axvline(recommended_tau, color="#2ca02c", linestyle="--", lw=2.0, label=f"Recommended τ* = {recommended_tau:.2f}")
+    axes[2].axvline(recommended_tau, color="#2ca02c", linestyle="--", lw=2.0, label=f"Val-Selected τ* = {recommended_tau:.2f}")
     axes[2].set_title("C. Selective Triage: Accuracy vs. Coverage Frontier", fontsize=11, fontweight="bold")
     axes[2].set_xlabel("Confidence Triage Threshold (τ)")
     axes[2].set_ylabel("Percentage (%)")
@@ -841,7 +1004,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1.2e-3, help="Base learning rate for AdamW.")
     parser.add_argument("--weight_decay", type=float, default=1e-2, help="Weight decay.")
     parser.add_argument("--val_fraction", type=float, default=0.15, help="Validation patient fraction.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument("--seed", type=int, default=42, help="Primary random seed.")
+    parser.add_argument(
+        "--seeds",
+        type=str,
+        default=None,
+        help="Optional comma-separated list of seeds (e.g. '42,43,44') for multi-seed mean±std benchmarking.",
+    )
     parser.add_argument("--device", type=str, default="auto", help="Compute device (auto/cuda/mps/cpu).")
     parser.add_argument("--max_samples", type=int, default=None, help="Optional slice cap for quick test.")
     parser.add_argument(
@@ -855,80 +1024,172 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _aggregate_multiseed_metrics(seed_runs: List[Dict[str, object]]) -> Dict[str, object]:
+    """Compute mean and standard deviation across multiple random seeds for each model."""
+    models = list(seed_runs[0]["models"].keys())
+    agg: Dict[str, object] = {}
+    scalar_keys = [
+        "accuracy",
+        "balanced_accuracy",
+        "macro_f1",
+        "auroc",
+        "pr_auc",
+        "temperature",
+        "selected_tau",
+        "ece_uncalibrated",
+        "ece_calibrated",
+        "brier_uncalibrated",
+        "brier_calibrated",
+    ]
+    patient_keys = [
+        "patient_accuracy",
+        "scan_mean_prob_accuracy",
+        "scan_majority_vote_accuracy",
+        "patient_macro_f1",
+        "patient_auroc",
+        "subject_accuracy",
+        "subject_macro_f1",
+        "subject_auroc",
+    ]
+
+    for m_name in models:
+        m_agg: Dict[str, object] = {"slice_level": {}, "patient_level": {}, "per_seed": []}
+        for sk in scalar_keys:
+            vals = [float(r["models"][m_name]["test_metrics"][sk]) for r in seed_runs]
+            m_agg["slice_level"][sk] = {
+                "mean": round(float(np.mean(vals)), 4),
+                "std": round(float(np.std(vals, ddof=0)), 4),
+                "values": [round(v, 4) for v in vals],
+            }
+        for pk in patient_keys:
+            vals = [float(r["models"][m_name]["test_metrics"]["patient_level"].get(pk, 0.0)) for r in seed_runs]
+            m_agg["patient_level"][pk] = {
+                "mean": round(float(np.mean(vals)), 4),
+                "std": round(float(np.std(vals, ddof=0)), 4),
+                "values": [round(v, 4) for v in vals],
+            }
+        for r in seed_runs:
+            tm = r["models"][m_name]["test_metrics"]
+            m_agg["per_seed"].append(
+                {
+                    "seed": r["seed"],
+                    "slice_accuracy": round(float(tm["accuracy"]), 4),
+                    "scan_accuracy": round(float(tm["patient_level"].get("patient_accuracy", 0.0)), 4),
+                    "subject_accuracy": round(float(tm["patient_level"].get("subject_accuracy", 0.0)), 4),
+                    "macro_f1": round(float(tm["macro_f1"]), 4),
+                    "auroc": round(float(tm["auroc"]), 4),
+                    "ece_uncalibrated": round(float(tm["ece_uncalibrated"]), 4),
+                    "ece_calibrated": round(float(tm["ece_calibrated"]), 4),
+                    "selected_tau": round(float(tm["selected_tau"]), 2),
+                }
+            )
+        agg[m_name] = m_agg
+    return agg
+
+
 def main() -> None:
     global IMAGES_DIR, CHECKPOINTS_DIR
     args = parse_args()
-    set_global_seed(args.seed)
     device = select_device(args.device)
     if args.split_mode != "longitudinal":
         IMAGES_DIR = IMAGES_DIR / args.split_mode
         CHECKPOINTS_DIR = CHECKPOINTS_DIR / args.split_mode
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    train_loader, val_loader, test_loader, audit_summary = build_adni_dataloaders(
-        data_root=args.data_root,
-        image_size=args.image_size,
-        batch_size=args.batch_size,
-        val_fraction=args.val_fraction,
-        seed=args.seed,
-        max_samples_per_split=args.max_samples,
-        return_meta_eval=True,
-        split_mode=args.split_mode,
+    seed_list = (
+        [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
+        if args.seeds
+        else [int(args.seed)]
     )
-    audit_summary["split_mode"] = args.split_mode
-
-    print("=== Patient-Level Data Hygiene Audit ===")
-    print(json.dumps(audit_summary, indent=2))
-
     models_to_run = ["baseline", "convnext"] if args.model == "both" else [args.model]
-    results_by_model: Dict[str, Dict[str, object]] = {}
+    all_seed_payloads: List[Dict[str, object]] = []
 
-    for m_name in models_to_run:
-        res = train_single_model(
-            model_name=m_name,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            test_loader=test_loader,
-            device=device,
-            epochs=args.epochs,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
+    for idx, current_seed in enumerate(seed_list):
+        print(f"\n================ SEED {current_seed} ({idx + 1}/{len(seed_list)}) — SPLIT: {args.split_mode.upper()} ================")
+        set_global_seed(current_seed)
+        train_loader, val_loader, test_loader, audit_summary = build_adni_dataloaders(
+            data_root=args.data_root,
             image_size=args.image_size,
-            seed=args.seed,
+            batch_size=args.batch_size,
+            val_fraction=args.val_fraction,
+            seed=current_seed,
+            max_samples_per_split=args.max_samples,
+            return_meta_eval=True,
+            split_mode=args.split_mode,
         )
-        results_by_model[m_name] = res
+        audit_summary["split_mode"] = args.split_mode
+        if idx == 0:
+            print("=== Patient & Subject Data Hygiene Audit ===")
+            print(json.dumps(audit_summary, indent=2))
 
-    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-    plot_training_curves(results_by_model, IMAGES_DIR / "training_curves.png")
-    plot_roc_pr_and_confusion(results_by_model, IMAGES_DIR / "roc_pr_comparison.png")
-    plot_dilemma_calibration_and_triage(results_by_model, IMAGES_DIR / "calibration_and_uncertainty.png")
+        results_by_model: Dict[str, Dict[str, object]] = {}
+        for m_name in models_to_run:
+            res = train_single_model(
+                model_name=m_name,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                test_loader=test_loader,
+                device=device,
+                epochs=args.epochs,
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+                image_size=args.image_size,
+                seed=current_seed,
+            )
+            results_by_model[m_name] = res
 
-    summary_payload = {
-        "device": str(device),
-        "audit": audit_summary,
-        "models": {
-            k: {
-                "resources": v["resources"],
-                "val_metrics": {
-                    mk: mv
-                    for mk, mv in v["val_metrics"].items()
-                    if mk not in ("curves", "distributions")
-                },
-                "test_metrics": {
-                    mk: mv
-                    for mk, mv in v["test_metrics"].items()
-                    if mk not in ("curves", "distributions")
-                },
-            }
-            for k, v in results_by_model.items()
-        },
-    }
+        summary_payload = {
+            "seed": current_seed,
+            "split_mode": args.split_mode,
+            "device": str(device),
+            "audit": audit_summary,
+            "models": {
+                k: {
+                    "resources": v["resources"],
+                    "val_metrics": {
+                        mk: mv
+                        for mk, mv in v["val_metrics"].items()
+                        if mk not in ("curves", "distributions")
+                    },
+                    "test_metrics": {
+                        mk: mv
+                        for mk, mv in v["test_metrics"].items()
+                        if mk not in ("curves", "distributions")
+                    },
+                }
+                for k, v in results_by_model.items()
+            },
+        }
+        all_seed_payloads.append(summary_payload)
 
-    CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CHECKPOINTS_DIR / "benchmark_summary.json", "w", encoding="utf-8") as f:
-        json.dump(summary_payload, f, indent=2)
+        if idx == 0:
+            IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+            plot_training_curves(results_by_model, IMAGES_DIR / "training_curves.png", split_mode=args.split_mode)
+            plot_roc_pr_and_confusion(results_by_model, IMAGES_DIR / "roc_pr_comparison.png")
+            plot_dilemma_calibration_and_triage(results_by_model, IMAGES_DIR / "calibration_and_uncertainty.png")
 
-    print(f"\nSaved plots to {IMAGES_DIR} and metrics to {CHECKPOINTS_DIR / 'benchmark_summary.json'}.")
+            CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
+            with open(CHECKPOINTS_DIR / "benchmark_summary.json", "w", encoding="utf-8") as f:
+                json.dump(summary_payload, f, indent=2)
+            with open(RESULTS_DIR / f"benchmark_{args.split_mode}.json", "w", encoding="utf-8") as f:
+                json.dump(summary_payload, f, indent=2)
+
+    if len(all_seed_payloads) > 1:
+        multiseed_summary = {
+            "split_mode": args.split_mode,
+            "seeds": seed_list,
+            "device": str(device),
+            "primary_seed_audit": all_seed_payloads[0]["audit"],
+            "aggregated": _aggregate_multiseed_metrics(all_seed_payloads),
+        }
+        out_multi = RESULTS_DIR / f"benchmark_{args.split_mode}_{len(seed_list)}seeds.json"
+        with open(out_multi, "w", encoding="utf-8") as f:
+            json.dump(multiseed_summary, f, indent=2)
+        print(f"\nSaved {len(seed_list)}-seed aggregated benchmark to {out_multi}")
+
+    print(f"\nSaved plots to {IMAGES_DIR} and metrics to {RESULTS_DIR / f'benchmark_{args.split_mode}.json'}.")
 
 
 if __name__ == "__main__":
     main()
+
