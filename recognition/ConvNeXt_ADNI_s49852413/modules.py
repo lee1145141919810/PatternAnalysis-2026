@@ -8,13 +8,25 @@ Strict Compliance Note (Section 4.1):
     and Python standard library typing annotations. It contains zero dependency on NumPy
     or any external third-party libraries.
 
+Code Attribution & Literature References (Section 6 Compliance):
+    - ConvNeXt block structure, channel-first `LayerNorm2d`, `DropPath`, and truncated-normal
+      initialization (`std=0.02`) are adapted in pure PyTorch from the official ConvNeXt paper
+      and reference implementation:
+        * Z. Liu, H. Mao, C.-Y. Wu, C. Feichtenhofer, T. Darrell, and S. Xie,
+          "A ConvNet for the 2020s," in Proc. IEEE/CVF CVPR, 2022, pp. 11976-11986.
+        * Official PyTorch repository: https://github.com/facebookresearch/ConvNeXt
+          (`models/convnext.py`, MIT License, Copyright (c) Meta Platforms, Inc.).
+    - Post-hoc Temperature Scaling is adapted from:
+        * C. Guo, G. Pleiss, Y. Sun, and K. Q. Weinberger, "On Calibration of Modern
+          Neural Networks," in Proc. ICML, 2017, pp. 1321-1330.
+
 Implemented Components:
     1. `LayerNorm2d`: Channel-first 2D Layer Normalization for `[B, C, H, W]` feature maps.
     2. `DropPath`: Stochastic Depth per-sample residual branch regularization.
     3. `ConvNeXtBlock`: Modernized ConvNet block with 7x7 depthwise convolution, inverted
        4x bottleneck, GELU activation, and learnable LayerScale (Liu et al., CVPR 2022).
     4. `ConvNeXt`: 4-stage hierarchical ConvNeXt backbone (`[Hard Difficulty]`).
-    5. `SimpleCNNBaseline`: Standard 3-stage 3x3 CNN benchmark (`Baseline Comparison`).
+    5. `SimpleCNNBaseline`: 4-stage 3x3 Conv + BatchNorm2d + ReLU + MaxPool2d baseline.
     6. `TemperatureScaledClassifier`: Post-hoc temperature scaling wrapper (`T > 0`) and
        predictive uncertainty / Shannon entropy quantifier for clinical triage routing.
 """
@@ -31,6 +43,7 @@ import torch.nn.functional as F
 class LayerNorm2d(nn.Module):
     """Channel-first 2D Layer Normalization for `[B, C, H, W]` feature maps.
 
+    Adapted from `facebookresearch/ConvNeXt` (`models/convnext.py`, `data_format="channels_first"`).
     Mathematical formulation:
         y_{b,c,h,w} = gamma_c * (x_{b,c,h,w} - mu_{b,h,w}) / sqrt(sigma^2_{b,h,w} + eps) + beta_c
     """
@@ -65,7 +78,7 @@ class DropPath(nn.Module):
 
 
 class ConvNeXtBlock(nn.Module):
-    """Modernized ConvNeXt Block (Liu et al., 'A ConvNet for the 2020s', CVPR 2022).
+    """Modernized ConvNeXt Block (Liu et al., CVPR 2022; adapted from `facebookresearch/ConvNeXt`).
 
     Architecture:
         x -> 7x7 Depthwise Conv (groups=dim) -> Permute [B, H, W, C] -> LayerNorm(dim)
@@ -112,10 +125,13 @@ class ConvNeXtBlock(nn.Module):
 class ConvNeXt(nn.Module):
     """4-Stage Hierarchical ConvNeXt Backbone for Neuroimaging Classification (`[Hard Difficulty]`).
 
-    Adapts the ConvNeXt architecture (Liu et al., CVPR 2022) to 1-channel T1-weighted
-    structural brain MRI scans. Uses a patchify stem followed by four spatial stages
-    with 2x2 stride-2 downsampling layers between stages, global average pooling,
-    final LayerNorm, and a linear classification head.
+    Adapts the ConvNeXt architecture (Liu et al., CVPR 2022; `facebookresearch/ConvNeXt`)
+    to 1-channel T1-weighted structural brain MRI scans. For a `96x96` input with `stem_stride=4`,
+    spatial feature map resolutions across the 4 stages are:
+        - `stages[0]` (`dim=32`):  `24 x 24`
+        - `stages[1]` (`dim=64`):  `12 x 12`
+        - `stages[2]` (`dim=128`): `6 x 6`  (6-block core representation stage; used for Grad-CAM)
+        - `stages[3]` (`dim=256`): `3 x 3`  (final semantic aggregation prior to global average pooling)
     """
 
     def __init__(
@@ -135,6 +151,7 @@ class ConvNeXt(nn.Module):
 
         self.depths = tuple(depths)
         self.dims = tuple(dims)
+        self.drop_path_rate = float(drop_path_rate)
 
         # Downsampling layers: 4x4 non-overlapping patchify stem + 3 inter-stage transition layers
         self.downsample_layers = nn.ModuleList()
@@ -209,11 +226,12 @@ class ConvNeXt(nn.Module):
 
 
 class SimpleCNNBaseline(nn.Module):
-    """Standard 2-stage Convolutional Neural Network Baseline for ADNI AD vs. NC screening.
+    """4-Stage Standard Convolutional Neural Network Baseline for ADNI AD vs. NC screening.
 
-    Serves as the mandatory Section 2.1 baseline benchmark using conventional 3x3
-    convolutions, ReLU activations, and MaxPool2d without residual connections,
-    large-kernel depthwise mixing, or LayerNorm.
+    Serves as a fair, matched-depth Section 2.1 baseline benchmark using conventional 3x3
+    dense convolutions, `BatchNorm2d`, `ReLU` activations, and 2x2 `MaxPool2d` across 4 stages
+    (`96x96 -> 48x48 -> 24x24 -> 12x12 -> 6x6`, channels `16 -> 32 -> 64 -> 128`, ~106K params),
+    without residual connections, 7x7 depthwise mixing, inverted bottlenecks, or `LayerNorm2d`.
     """
 
     def __init__(
@@ -226,14 +244,28 @@ class SimpleCNNBaseline(nn.Module):
         super().__init__()
         c1 = base_channels
         c2 = base_channels * 2
+        c3 = base_channels * 4
+        c4 = base_channels * 8
 
         self.features = nn.Sequential(
-            # Stage 1: local 3x3 receptive field
-            nn.Conv2d(in_channels, c1, kernel_size=3, stride=2, padding=1),
+            # Stage 1: 96x96 -> 48x48
+            nn.Conv2d(in_channels, c1, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(c1),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=4, stride=4),
-            # Stage 2: local 3x3 receptive field
-            nn.Conv2d(c1, c2, kernel_size=3, stride=2, padding=1),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            # Stage 2: 48x48 -> 24x24
+            nn.Conv2d(c1, c2, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            # Stage 3: 24x24 -> 12x12
+            nn.Conv2d(c2, c3, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(c3),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            # Stage 4: 12x12 -> 6x6
+            nn.Conv2d(c3, c4, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(c4),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
         )
@@ -241,13 +273,13 @@ class SimpleCNNBaseline(nn.Module):
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Dropout(p=dropout),
-            nn.Linear(c2, c2),
+            nn.Linear(c4, c3),
             nn.ReLU(inplace=True),
-            nn.Linear(c2, num_classes),
+            nn.Linear(c3, num_classes),
         )
 
     def get_last_feature_map(self, x: torch.Tensor) -> torch.Tensor:
-        """Return final spatial feature map `[B, C, H', W']` for spatial attribution."""
+        """Return final spatial feature map `[B, C, 6, 6]` for spatial attribution."""
         return self.features(x)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
@@ -331,22 +363,29 @@ class TemperatureScaledClassifier(nn.Module):
 
         optimizer = torch.optim.LBFGS([self.log_temperature], lr=lr, max_iter=max_iter)
 
-        def _eval_closure() -> torch.Tensor:
+        def _eval_closure() -> float:
             optimizer.zero_grad()
             scaled = logits_detached / self.temperature
             loss = F.cross_entropy(scaled, labels_detached)
             loss.backward()
-            return loss
+            return float(loss.detach().item())
 
         optimizer.step(_eval_closure)
         return float(self.temperature.detach().cpu().item())
 
 
-def compute_spatial_attribution(model: nn.Module, x: torch.Tensor, target_class: int | None = None) -> torch.Tensor:
+def compute_spatial_attribution(
+    model: nn.Module,
+    x: torch.Tensor,
+    target_class: int | None = None,
+    convnext_stage_index: int = 2,
+) -> torch.Tensor:
     """Compute Grad-CAM spatial attribution heatmap `[B, H, W]` in pure PyTorch.
 
-    Highlights which anatomical regions (e.g., lateral ventricles, hippocampal / medial
-    temporal cortex, or peripheral skull boundaries) drove the network's prediction.
+    For `ConvNeXt` on `96x96` inputs, hooks onto `stages[2]` (`6x6` spatial feature map
+    after the 6-block core representation stage; `12x12` if `convnext_stage_index=1`)
+    rather than `stages[3]` (`3x3`), preserving sufficient spatial granularity to
+    distinguish central ventricular regions from peripheral cortical boundaries.
     """
     base = model.base_model if isinstance(model, TemperatureScaledClassifier) else model
     base.eval()
@@ -355,8 +394,10 @@ def compute_spatial_attribution(model: nn.Module, x: torch.Tensor, target_class:
     saved_acts: list[torch.Tensor] = []
     saved_grads: list[torch.Tensor] = []
 
-    # Hook onto the final convolutional stage
-    target_layer = base.stages[-1] if isinstance(base, ConvNeXt) else base.features
+    if isinstance(base, ConvNeXt):
+        target_layer = base.stages[convnext_stage_index]
+    else:
+        target_layer = base.features
 
     def _fwd_hook(_mod: nn.Module, _inp: Tuple[torch.Tensor, ...], out: torch.Tensor) -> None:
         saved_acts.append(out)
@@ -393,7 +434,7 @@ def build_model(
     model_name: str = "convnext",
     in_channels: int = 1,
     num_classes: int = 2,
-    drop_path_rate: float = 0.15,
+    drop_path_rate: float = 0.10,
 ) -> nn.Module:
     """Factory function to instantiate `ConvNeXt` variants or `SimpleCNNBaseline`."""
     name = model_name.lower().strip()
@@ -429,7 +470,7 @@ def count_parameters(model: nn.Module) -> Tuple[int, int]:
 
 
 if __name__ == "__main__":
-    x_dummy = torch.randn(4, 1, 128, 128)
+    x_dummy = torch.randn(4, 1, 96, 96)
     for m_name in ("baseline", "convnext"):
         net = build_model(m_name)
         tot_p, tr_p = count_parameters(net)
