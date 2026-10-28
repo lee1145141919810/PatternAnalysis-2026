@@ -145,6 +145,8 @@ class ConvNeXt(nn.Module):
         head_dropout: float = 0.2,
         stem_stride: int = 4,
         use_overlapping_bn_stem: bool = False,
+        use_overlapping_stem: bool = False,
+        use_bn_norm: bool = False,
     ) -> None:
         super().__init__()
         if len(depths) != 4 or len(dims) != 4:
@@ -154,25 +156,28 @@ class ConvNeXt(nn.Module):
         self.dims = tuple(dims)
         self.drop_path_rate = float(drop_path_rate)
         self.use_overlapping_bn_stem = bool(use_overlapping_bn_stem)
+        self.use_overlapping_stem = bool(use_overlapping_stem or use_overlapping_bn_stem)
+        self.use_bn_norm = bool(use_bn_norm or use_overlapping_bn_stem)
 
-        # Downsampling layers: standard 4x4 non-overlapping patchify stem + LayerNorm2d transitions,
-        # or optional overlapping 3x3 Conv + BatchNorm2d stem/transitions for small-cohort ablation
+        def _make_norm(channels: int) -> nn.Module:
+            if self.use_bn_norm:
+                return nn.BatchNorm2d(channels)
+            return LayerNorm2d(channels, eps=1e-6)
+
+        use_conv_bias = not self.use_bn_norm
+
+        # Downsampling layers: decoupled 2x2 factorial design over
+        # (1) stem spatial overlap (4x4 stride-4 patchify vs two-stage 3x3 stride-2 overlapping stem) and
+        # (2) stem/transition normalization (LayerNorm2d vs BatchNorm2d)
         self.downsample_layers = nn.ModuleList()
-        if self.use_overlapping_bn_stem:
+        if self.use_overlapping_stem:
             stem = nn.Sequential(
-                nn.Conv2d(in_channels, dims[0], kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(dims[0]),
+                nn.Conv2d(in_channels, dims[0], kernel_size=3, stride=2, padding=1, bias=use_conv_bias),
+                _make_norm(dims[0]),
                 nn.GELU(),
-                nn.Conv2d(dims[0], dims[0], kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(dims[0]),
+                nn.Conv2d(dims[0], dims[0], kernel_size=3, stride=2, padding=1, bias=use_conv_bias),
+                _make_norm(dims[0]),
             )
-            self.downsample_layers.append(stem)
-            for i in range(3):
-                downsample_layer = nn.Sequential(
-                    nn.BatchNorm2d(dims[i]),
-                    nn.Conv2d(dims[i], dims[i + 1], kernel_size=2, stride=2, bias=False),
-                )
-                self.downsample_layers.append(downsample_layer)
         else:
             stem = nn.Sequential(
                 nn.Conv2d(
@@ -181,16 +186,17 @@ class ConvNeXt(nn.Module):
                     kernel_size=4,
                     stride=stem_stride,
                     padding=1 if stem_stride == 2 else 0,
+                    bias=use_conv_bias,
                 ),
-                LayerNorm2d(dims[0], eps=1e-6),
+                _make_norm(dims[0]),
             )
-            self.downsample_layers.append(stem)
-            for i in range(3):
-                downsample_layer = nn.Sequential(
-                    LayerNorm2d(dims[i], eps=1e-6),
-                    nn.Conv2d(dims[i], dims[i + 1], kernel_size=2, stride=2),
-                )
-                self.downsample_layers.append(downsample_layer)
+        self.downsample_layers.append(stem)
+        for i in range(3):
+            downsample_layer = nn.Sequential(
+                _make_norm(dims[i]),
+                nn.Conv2d(dims[i], dims[i + 1], kernel_size=2, stride=2, bias=use_conv_bias),
+            )
+            self.downsample_layers.append(downsample_layer)
 
         # Stochastic depth decay schedule across all blocks
         total_blocks = sum(depths)
@@ -463,6 +469,28 @@ def build_model(
             layer_scale_init_value=0.1,
             stem_stride=4,
         )
+    if name == "convnext_patchify_bn":
+        return ConvNeXt(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            depths=(2, 2, 6, 2),
+            dims=(32, 64, 128, 256),
+            drop_path_rate=drop_path_rate,
+            layer_scale_init_value=0.1,
+            stem_stride=4,
+            use_bn_norm=True,
+        )
+    if name == "convnext_overlap_ln":
+        return ConvNeXt(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            depths=(2, 2, 6, 2),
+            dims=(32, 64, 128, 256),
+            drop_path_rate=drop_path_rate,
+            layer_scale_init_value=0.1,
+            stem_stride=4,
+            use_overlapping_stem=True,
+        )
     if name == "convnext_bn_stem":
         return ConvNeXt(
             in_channels=in_channels,
@@ -486,7 +514,8 @@ def build_model(
     if name in ("baseline", "simple_cnn", "cnn"):
         return SimpleCNNBaseline(in_channels=in_channels, num_classes=num_classes)
     raise ValueError(
-        f"Unknown model_name '{model_name}'. Choose from: convnext, convnext_bn_stem, convnext_tiny, baseline."
+        f"Unknown model_name '{model_name}'. Choose from: convnext, convnext_patchify_bn, "
+        f"convnext_overlap_ln, convnext_bn_stem, convnext_tiny, baseline."
     )
 
 

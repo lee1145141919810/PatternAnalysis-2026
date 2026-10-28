@@ -63,7 +63,7 @@ def test_convnext_and_baseline_forward_backward() -> None:
     x = torch.randn(4, 1, 96, 96)
     y = torch.tensor([0, 1, 0, 1], dtype=torch.long)
 
-    for name in ("baseline", "convnext", "convnext_bn_stem"):
+    for name in ("baseline", "convnext", "convnext_patchify_bn", "convnext_overlap_ln", "convnext_bn_stem"):
         model = build_model(name, in_channels=1, num_classes=2)
         logits = model(x)
         assert logits.shape == (4, 2)
@@ -157,7 +157,8 @@ def test_subject_disjoint_split_has_zero_subject_leakage(tmp_path: Path) -> None
         c_name = "AD" if lab == 1 else "NC"
         for scan_k in range(4):
             scan_id = f"{s_idx*10 + scan_k + 100:06d}"
-            meta_payload[scan_id] = {"raw": f"ADNI_{subj_str}_MR__br_raw_20180101_{scan_id}"}
+            raw_tag = "_br_raw_" if scan_k % 2 == 0 else "__raw_"
+            meta_payload[scan_id] = {"raw": f"ADNI_{subj_str}_MR_{raw_tag}20180101_{scan_id}"}
             for sl in range(2):
                 records.append(
                     SliceRecord(
@@ -239,7 +240,9 @@ def test_era_slice_position_and_ddof1_aggregation() -> None:
     m = compute_comprehensive_metrics(logits, labels, temperature=1.0, metas=metas)
     assert "pre_2017_adni2" in m["era_stratified"]
     assert "post_2017_adni3" in m["era_stratified"]
+    assert "ad_recall_ci95" in m["era_stratified"]["post_2017_adni3"]
     assert len(m["slice_position_quintiles"]) == 5
+    assert "accuracy_ci95" in m["slice_position_quintiles"][0]
     assert m["patient_level"]["scan_acc_ci95_method"] == "subject_cluster_bootstrap_1000"
 
     # Check ddof=1 vs ddof=0 in _aggregate_multiseed_metrics
@@ -253,5 +256,14 @@ def test_era_slice_position_and_ddof1_aggregation() -> None:
     assert agg["baseline"]["slice_level"]["accuracy"]["ddof"] == 1
     assert abs(agg["baseline"]["slice_level"]["accuracy"]["std"] - float(np.std([1.0, 0.5], ddof=1))) < 1e-4
     assert "paired_baseline_minus_convnext" in agg
+
+
+def test_readme_numbers_match_json_artifacts() -> None:
+    """Verify that key statistics reported in README.md match the JSON files in results/."""
+    from make_tables import verify_readme_matches_json
+
+    ok, mismatches = verify_readme_matches_json()
+    assert ok, "README.md numerical mismatch against results/*.json:\n" + "\n".join(mismatches)
+
 
 

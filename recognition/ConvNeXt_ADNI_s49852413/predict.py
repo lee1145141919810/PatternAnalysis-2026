@@ -225,9 +225,12 @@ def conduct_failure_case_autopsy(
     # Pre-compute per-scan slice index ranges and 20-slice scan-level mean AD probability
     scan_slice_indices: Dict[str, List[int]] = {}
     scan_ad_probs: Dict[str, List[float]] = {}
+    baseline_scan_ad_probs: Dict[str, List[float]] = {}
     for i, r in enumerate(test_ds.records):
         scan_slice_indices.setdefault(r.patient_id, []).append(int(r.slice_index))
         scan_ad_probs.setdefault(r.patient_id, []).append(float(cal_probs[i, 1]))
+        if baseline_probs is not None:
+            baseline_scan_ad_probs.setdefault(r.patient_id, []).append(float(baseline_probs[i, 1]))
 
     fn_indices = np.where((y_true == 1) & (y_pred == 0))[0]
     fp_indices = np.where((y_true == 0) & (y_pred == 1))[0]
@@ -425,6 +428,9 @@ def conduct_failure_case_autopsy(
                 "predictive_entropy": round(entropy, 4),
                 "baseline_confidence": round(float(np.max(baseline_probs[ds_idx])), 4)
                 if baseline_probs is not None
+                else None,
+                "baseline_scan_20slice_mean_prob_ad": round(float(np.mean(baseline_scan_ad_probs[rec.patient_id])), 4)
+                if baseline_probs is not None and rec.patient_id in baseline_scan_ad_probs
                 else None,
                 "brain_foreground_fraction": round(brain_area_frac, 4),
                 "central_csf_dark_fraction": round(ventricle_dark_frac, 4),

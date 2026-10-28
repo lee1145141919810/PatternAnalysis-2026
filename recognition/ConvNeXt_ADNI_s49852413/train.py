@@ -407,8 +407,11 @@ def compute_comprehensive_metrics(
             "num_subjects": int(len(s_true)),
         }
 
-        # Era-stratified evaluation (< 2017 ADNI-2 era vs. >= 2017 ADNI-3 era)
+        # Era-stratified evaluation (< 2017 ADNI-2 era vs. >= 2017 ADNI-3 era) with subject-level cluster bootstrap CIs
         years_arr = np.array([int(m.get("acquisition_year", 0) or 0) for m in metas], dtype=np.int64)
+        sids_arr = np.array([str(m.get("subject_id", m["patient_id"])) for m in metas])
+        era_stratified["unknown_year_slices"] = int(np.sum(years_arr <= 0))
+        era_stratified["unknown_year_scans"] = int(sum(1 for p in sorted_pids if p not in pid_to_year))
         if np.any(years_arr > 0):
             for era_name, mask in [
                 ("pre_2017_adni2", (years_arr > 0) & (years_arr < 2017)),
@@ -419,6 +422,7 @@ def compute_comprehensive_metrics(
                 ey_true = y_true[mask]
                 ey_pred = y_pred[mask]
                 ey_score = y_score_ad[mask]
+                esids = sids_arr[mask]
                 ad_m = ey_true == 1
                 nc_m = ey_true == 0
                 ad_rec = float(np.mean(ey_pred[ad_m] == 1)) if np.any(ad_m) else 0.0
@@ -427,18 +431,88 @@ def compute_comprehensive_metrics(
                     p for p in sorted_pids
                     if p in pid_to_year and ((pid_to_year[p] < 2017) if era_name == "pre_2017_adni2" else (pid_to_year[p] >= 2017))
                 ]
+                era_ad_pids = [p for p in era_pids if pid_labels[p] == 1]
+                era_nc_pids = [p for p in era_pids if pid_labels[p] == 0]
+                era_sids = sorted({pid_to_sid[p] for p in era_pids})
+                era_ad_sids = sorted({pid_to_sid[p] for p in era_ad_pids})
+                era_nc_sids = sorted({pid_to_sid[p] for p in era_nc_pids})
                 era_scan_acc = float(np.mean([pid_correct_map[p] for p in era_pids])) if era_pids else 0.0
+
+                # Subject-level cluster bootstrap (1,000 resamples over unique subjects in this era)
+                sid_to_mask_idx: Dict[str, np.ndarray] = {
+                    s: np.where(esids == s)[0] for s in era_sids
+                }
+                sid_to_era_pids: Dict[str, List[str]] = defaultdict(list)
+                for p in era_pids:
+                    sid_to_era_pids[pid_to_sid[p]].append(p)
+
+                rng_era = np.random.default_rng(42)
+                boot_ad_rec: List[float] = []
+                boot_nc_rec: List[float] = []
+                boot_bal_acc: List[float] = []
+                boot_auroc: List[float] = []
+                boot_scan_acc: List[float] = []
+                for _ in range(1000):
+                    # Stratified subject cluster resample when both classes exist, else single-class subject cluster resample
+                    if era_ad_sids and era_nc_sids:
+                        samp_ad = rng_era.choice(era_ad_sids, size=len(era_ad_sids), replace=True)
+                        samp_nc = rng_era.choice(era_nc_sids, size=len(era_nc_sids), replace=True)
+                        samp_sids = list(samp_ad) + list(samp_nc)
+                    else:
+                        samp_sids = list(rng_era.choice(era_sids, size=len(era_sids), replace=True))
+                    idx_cat = np.concatenate([sid_to_mask_idx[str(s)] for s in samp_sids])
+                    by_t = ey_true[idx_cat]
+                    by_p = ey_pred[idx_cat]
+                    by_s = ey_score[idx_cat]
+                    b_ad_m = by_t == 1
+                    b_nc_m = by_t == 0
+                    b_ad_r = float(np.mean(by_p[b_ad_m] == 1)) if np.any(b_ad_m) else 0.0
+                    b_nc_r = float(np.mean(by_p[b_nc_m] == 0)) if np.any(b_nc_m) else 0.0
+                    boot_ad_rec.append(b_ad_r)
+                    boot_nc_rec.append(b_nc_r)
+                    boot_bal_acc.append(0.5 * (b_ad_r + b_nc_r) if (np.any(b_ad_m) and np.any(b_nc_m)) else b_ad_r)
+                    if len(np.unique(by_t)) > 1:
+                        boot_auroc.append(float(roc_auc_score(by_t, by_s)))
+                    b_scans = [pid_correct_map[p] for s in samp_sids for p in sid_to_era_pids[str(s)]]
+                    if b_scans:
+                        boot_scan_acc.append(float(np.mean(b_scans)))
+
                 era_stratified[era_name] = {
                     "num_slices": int(np.sum(mask)),
                     "num_scans": int(len(era_pids)),
+                    "ad_scans": int(len(era_ad_pids)),
+                    "nc_scans": int(len(era_nc_pids)),
+                    "num_subjects": int(len(era_sids)),
+                    "ad_subjects": int(len(era_ad_sids)),
+                    "nc_subjects": int(len(era_nc_sids)),
                     "ad_slices": int(np.sum(ad_m)),
                     "nc_slices": int(np.sum(nc_m)),
                     "slice_accuracy": round(float(accuracy_score(ey_true, ey_pred)), 4),
                     "balanced_accuracy": round(float(0.5 * (ad_rec + nc_rec)), 4),
+                    "balanced_accuracy_ci95": [
+                        round(float(np.percentile(boot_bal_acc, 2.5)), 4),
+                        round(float(np.percentile(boot_bal_acc, 97.5)), 4),
+                    ] if boot_bal_acc else [0.0, 0.0],
                     "ad_recall": round(ad_rec, 4),
+                    "ad_recall_ci95": [
+                        round(float(np.percentile(boot_ad_rec, 2.5)), 4),
+                        round(float(np.percentile(boot_ad_rec, 97.5)), 4),
+                    ] if boot_ad_rec else [0.0, 0.0],
                     "nc_recall": round(nc_rec, 4),
+                    "nc_recall_ci95": [
+                        round(float(np.percentile(boot_nc_rec, 2.5)), 4),
+                        round(float(np.percentile(boot_nc_rec, 97.5)), 4),
+                    ] if (boot_nc_rec and np.any(nc_m)) else [0.0, 0.0],
                     "auroc": round(float(roc_auc_score(ey_true, ey_score)), 4) if len(np.unique(ey_true)) > 1 else 0.0,
+                    "auroc_ci95": [
+                        round(float(np.percentile(boot_auroc, 2.5)), 4),
+                        round(float(np.percentile(boot_auroc, 97.5)), 4),
+                    ] if boot_auroc else [0.0, 0.0],
                     "scan_accuracy": round(era_scan_acc, 4),
+                    "scan_accuracy_ci95": [
+                        round(float(np.percentile(boot_scan_acc, 2.5)), 4),
+                        round(float(np.percentile(boot_scan_acc, 97.5)), 4),
+                    ] if boot_scan_acc else [0.0, 0.0],
                 }
 
         # Empirical accuracy & false negative rate across 5 relative slice position (rel_pos) quintiles
@@ -458,16 +532,32 @@ def compute_comprehensive_metrics(
                 continue
             qy_true = y_true[q_mask]
             qy_pred = y_pred[q_mask]
+            q_sids = sids_arr[q_mask]
             q_ad = qy_true == 1
             q_nc = qy_true == 0
             q_fn_rate = float(np.mean(qy_pred[q_ad] == 0)) if np.any(q_ad) else 0.0
             q_fp_rate = float(np.mean(qy_pred[q_nc] == 1)) if np.any(q_nc) else 0.0
+
+            # Subject-level cluster bootstrap CI for quintile accuracy
+            q_unique_sids = sorted(set(q_sids.tolist()))
+            q_sid_idx = {s: np.where(q_sids == s)[0] for s in q_unique_sids}
+            rng_q = np.random.default_rng(42 + q_idx)
+            q_boot_acc: List[float] = []
+            for _ in range(1000):
+                samp_q_sids = rng_q.choice(q_unique_sids, size=len(q_unique_sids), replace=True)
+                q_cat = np.concatenate([q_sid_idx[str(s)] for s in samp_q_sids])
+                q_boot_acc.append(float(np.mean(qy_true[q_cat] == qy_pred[q_cat])))
+
             slice_position_quintiles.append(
                 {
                     "quintile": q_idx + 1,
                     "rel_pos_range": f"[{q_lo:.1f}, {min(1.0, q_hi):.1f}{']' if q_idx == 4 else ')'}",
                     "num_slices": int(np.sum(q_mask)),
                     "accuracy": round(float(accuracy_score(qy_true, qy_pred)), 4),
+                    "accuracy_ci95": [
+                        round(float(np.percentile(q_boot_acc, 2.5)), 4),
+                        round(float(np.percentile(q_boot_acc, 97.5)), 4),
+                    ],
                     "fn_rate_on_ad": round(q_fn_rate, 4),
                     "fp_rate_on_nc": round(q_fp_rate, 4),
                     "mean_confidence": round(float(np.mean(cal_conf[q_mask])), 4),
@@ -565,10 +655,38 @@ def profile_inference_latency(
     batch_size: int = 128,
     num_iters: int = 30,
 ) -> Dict[str, float]:
-    """Profile single-slice latency (ms) and batched throughput (slices/sec) at `batch_size=128`."""
+    """Profile single-slice latency (ms), batched throughput (slices/sec), and analytical inference peak memory at `batch_size=128`."""
     model.eval()
     x_single = torch.randn(1, 1, image_size, image_size, device=device)
     x_batch = torch.randn(batch_size, 1, image_size, image_size, device=device)
+
+    # Measure exact parameter+buffer footprint and maximum single-layer activation tensor at batch_size=128
+    param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    buffer_bytes = sum(b.numel() * b.element_size() for b in model.buffers())
+    model_param_buffer_mb = (param_bytes + buffer_bytes) / (1024.0 * 1024.0)
+    input_batch_mb = (x_batch.numel() * x_batch.element_size()) / (1024.0 * 1024.0)
+
+    max_act_bytes = [0]
+    hooks = []
+
+    def _act_hook(_mod: nn.Module, _inp: object, out: object) -> None:
+        if isinstance(out, torch.Tensor):
+            nbytes = out.numel() * out.element_size()
+            if nbytes > max_act_bytes[0]:
+                max_act_bytes[0] = nbytes
+
+    for m in model.modules():
+        if m is not model:
+            hooks.append(m.register_forward_hook(_act_hook))
+    with torch.no_grad():
+        _ = model(x_batch)
+    for h in hooks:
+        h.remove()
+
+    max_act_mb = max_act_bytes[0] / (1024.0 * 1024.0)
+    # Analytical upper bound during torch.no_grad() inference: weights + input batch + 2.5x peak activation buffer
+    # (accounting for simultaneous residual + intermediate bottleneck + output buffer inside a single block)
+    inference_analytical_peak_mb = model_param_buffer_mb + input_batch_mb + 2.5 * max_act_mb
 
     # Warmup
     with torch.no_grad():
@@ -607,6 +725,10 @@ def profile_inference_latency(
         "single_slice_latency_ms": float(single_ms),
         "batched_per_slice_latency_ms": float(batch_per_slice_ms),
         "throughput_slices_per_sec": float(throughput_fps),
+        "model_param_buffer_mb": round(float(model_param_buffer_mb), 3),
+        "inference_input_batch_mb": round(float(input_batch_mb), 2),
+        "inference_max_single_activation_mb": round(float(max_act_mb), 2),
+        "inference_analytical_peak_mb": round(float(inference_analytical_peak_mb), 2),
     }
 
 
@@ -1116,8 +1238,17 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=str,
         default="both",
-        choices=["both", "convnext", "convnext_bn_stem", "baseline", "convnext_tiny"],
-        help="Model architecture to train (`both` runs ConvNeXt and SimpleCNNBaseline).",
+        choices=[
+            "both",
+            "ablation_stem",
+            "convnext",
+            "convnext_patchify_bn",
+            "convnext_overlap_ln",
+            "convnext_bn_stem",
+            "baseline",
+            "convnext_tiny",
+        ],
+        help="Model architecture to train (`both` runs ConvNeXt and SimpleCNNBaseline; `ablation_stem` runs the 2x2 stem/norm variants).",
     )
     parser.add_argument("--image_size", type=int, default=96, help="Input spatial resolution.")
     parser.add_argument("--batch_size", type=int, default=128, help="Mini-batch size.")
@@ -1176,7 +1307,13 @@ def _aggregate_multiseed_metrics(seed_runs: List[Dict[str, object]]) -> Dict[str
     ]
 
     for m_name in models:
-        m_agg: Dict[str, object] = {"slice_level": {}, "patient_level": {}, "per_seed": []}
+        tot_p = int(seed_runs[0]["models"][m_name].get("resources", {}).get("total_params", 0))
+        m_agg: Dict[str, object] = {
+            "total_params": tot_p,
+            "slice_level": {},
+            "patient_level": {},
+            "per_seed": [],
+        }
         for sk in scalar_keys:
             vals = [float(r["models"][m_name]["test_metrics"].get(sk, 0.0)) for r in seed_runs]
             m_agg["slice_level"][sk] = {
@@ -1228,6 +1365,25 @@ def _aggregate_multiseed_metrics(seed_runs: List[Dict[str, object]]) -> Dict[str
             }
         agg["paired_baseline_minus_convnext"] = paired
 
+    if "convnext" in models:
+        for var_name in ("convnext_patchify_bn", "convnext_overlap_ln", "convnext_bn_stem"):
+            if var_name in models:
+                paired_var: Dict[str, object] = {}
+                for k_label, getter in [
+                    ("slice_accuracy", lambda r, m: float(r["models"][m]["test_metrics"]["accuracy"])),
+                    ("scan_accuracy", lambda r, m: float(r["models"][m]["test_metrics"]["patient_level"].get("patient_accuracy", 0.0))),
+                    ("subject_accuracy", lambda r, m: float(r["models"][m]["test_metrics"]["patient_level"].get("subject_accuracy", 0.0))),
+                    ("macro_f1", lambda r, m: float(r["models"][m]["test_metrics"]["macro_f1"])),
+                    ("auroc", lambda r, m: float(r["models"][m]["test_metrics"]["auroc"])),
+                ]:
+                    diffs = [getter(r, var_name) - getter(r, "convnext") for r in seed_runs]
+                    paired_var[k_label] = {
+                        "mean_diff_vs_convnext": round(float(np.mean(diffs)), 4),
+                        "std_diff_ddof1": round(float(np.std(diffs, ddof=ddof)), 4),
+                        "per_seed_diffs": [round(d, 4) for d in diffs],
+                    }
+                agg[f"paired_{var_name}_minus_convnext"] = paired_var
+
     return agg
 
 
@@ -1245,7 +1401,12 @@ def main() -> None:
         if args.seeds
         else [int(args.seed)]
     )
-    models_to_run = ["baseline", "convnext"] if args.model == "both" else [args.model]
+    if args.model == "both":
+        models_to_run = ["baseline", "convnext"]
+    elif args.model == "ablation_stem":
+        models_to_run = ["convnext", "convnext_patchify_bn", "convnext_overlap_ln", "convnext_bn_stem"]
+    else:
+        models_to_run = [args.model]
     all_seed_payloads: List[Dict[str, object]] = []
 
     for idx, current_seed in enumerate(seed_list):
@@ -1307,7 +1468,7 @@ def main() -> None:
         }
         all_seed_payloads.append(summary_payload)
 
-        if idx == 0:
+        if idx == 0 and args.model != "ablation_stem":
             IMAGES_DIR.mkdir(parents=True, exist_ok=True)
             plot_training_curves(results_by_model, IMAGES_DIR / "training_curves.png", split_mode=args.split_mode)
             plot_roc_pr_and_confusion(results_by_model, IMAGES_DIR / "roc_pr_comparison.png")
@@ -1318,6 +1479,23 @@ def main() -> None:
                 json.dump(summary_payload, f, indent=2)
             with open(RESULTS_DIR / f"benchmark_{args.split_mode}.json", "w", encoding="utf-8") as f:
                 json.dump(summary_payload, f, indent=2)
+
+    if args.model == "ablation_stem":
+        ablation_summary = {
+            "split_mode": args.split_mode,
+            "seeds": seed_list,
+            "device": str(device),
+            "aggregated": _aggregate_multiseed_metrics(all_seed_payloads),
+            "seed42_era_stratified": {
+                m_k: m_v["test_metrics"].get("era_stratified", {})
+                for m_k, m_v in all_seed_payloads[0]["models"].items()
+            },
+        }
+        out_abl = RESULTS_DIR / f"ablation_stem_{len(seed_list)}seeds.json"
+        with open(out_abl, "w", encoding="utf-8") as f:
+            json.dump(ablation_summary, f, indent=2)
+        print(f"\nSaved {len(seed_list)}-seed stem/normalization ablation to {out_abl}")
+        return
 
     if len(all_seed_payloads) > 1:
         multiseed_summary = {

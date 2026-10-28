@@ -41,17 +41,17 @@ def classify_protocol(raw_path_str: str) -> str:
     if not raw_path_str:
         return "Unmapped"
     if "IR-FSPGR" in raw_path_str or "IR_FSPGR" in raw_path_str:
-        return "ADNI3_Accelerated_Sag_IR-FSPGR"
+        return "Accelerated_Sag_IR-FSPGR"
     if "Accelerated_Sagittal_MPRAGE" in raw_path_str or "Accelerated_Sag_MPRAGE" in raw_path_str:
-        return "ADNI3_Accelerated_Sagittal_MPRAGE"
+        return "Accelerated_Sagittal_MPRAGE"
     if "MPRAGE" in raw_path_str or "MP-RAGE" in raw_path_str:
-        return "ADNI2_Standard_Sagittal_MPRAGE"
+        return "Standard_Sagittal_MPRAGE"
     return "Other_T1_Sequence"
 
 
 def extract_year(raw_path_str: str) -> int | None:
-    """Extract 4-digit acquisition year from ADNI NIfTI timestamp `_br_raw_YYYYMMDD...`."""
-    m = re.search(r"_br_raw_(\d{4})\d{4}", raw_path_str)
+    """Extract 4-digit acquisition year from ADNI NIfTI timestamp (`_br_raw_YYYYMMDD` or `__raw_YYYYMMDD`)."""
+    m = re.search(r"_(?:br_)?raw_(\d{4})\d{4}", raw_path_str)
     if m:
         return int(m.group(1))
     return None

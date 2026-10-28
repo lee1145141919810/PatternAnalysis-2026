@@ -465,7 +465,7 @@ def _scan_to_subject_map(
             else:
                 unmapped_scans.append(r.patient_id)
                 mapping[r.patient_id] = r.patient_id
-            m_yr = re.search(r"_br_raw_(\d{4})\d{4}", raw_str)
+            m_yr = re.search(r"_(?:br_)?raw_(\d{4})\d{4}", raw_str)
             year_mapping[r.patient_id] = int(m_yr.group(1)) if m_yr else None
         object.__setattr__(r, "subject_id", mapping[r.patient_id])
         object.__setattr__(r, "acquisition_year", year_mapping[r.patient_id])
