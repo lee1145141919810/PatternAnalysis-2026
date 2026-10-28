@@ -142,20 +142,21 @@ def test_filename_patient_extraction_and_zscore() -> None:
 
 
 def test_subject_disjoint_split_has_zero_subject_leakage(tmp_path: Path) -> None:
-    """Verify that _split_subject_disjoint guarantees zero subject overlap across splits."""
+    """Verify that _split_subject_disjoint guarantees zero subject overlap and longitudinal detects subject sharing."""
     import json
-    from dataset import _scan_to_subject_map, _split_subject_disjoint
+    import pytest
+    from dataset import _scan_to_subject_map, _split_longitudinal_with_metadata, _split_subject_disjoint
 
     meta_file = tmp_path / "meta.json"
     meta_payload = {}
     records = []
-    # Create 12 synthetic subjects, each with 2 scans, each scan with 2 slices
+    # Create 12 synthetic subjects, each with 4 scans, each scan with 2 slices
     for s_idx in range(12):
         subj_str = f"999_S_{s_idx:04d}"
         lab = s_idx % 2
         c_name = "AD" if lab == 1 else "NC"
-        for scan_k in range(2):
-            scan_id = f"I{s_idx*10 + scan_k:06d}"
+        for scan_k in range(4):
+            scan_id = f"{s_idx*10 + scan_k + 100:06d}"
             meta_payload[scan_id] = {"raw": f"ADNI_{subj_str}_MR_{scan_id}"}
             for sl in range(2):
                 records.append(
@@ -169,17 +170,26 @@ def test_subject_disjoint_split_has_zero_subject_leakage(tmp_path: Path) -> None
                 )
 
     meta_file.write_text(json.dumps(meta_payload), encoding="utf-8")
-    scan2subj = _scan_to_subject_map(records, meta_file)
+    scan2subj = _scan_to_subject_map(records, meta_file, strict=True)
     tr, va, te = _split_subject_disjoint(records, meta_file, seed=42, val_fraction=0.2, test_fraction=0.2)
 
-    tr_subjs = {scan2subj[r.patient_id] for r in tr}
-    va_subjs = {scan2subj[r.patient_id] for r in va}
-    te_subjs = {scan2subj[r.patient_id] for r in te}
+    audit_subj = verify_no_patient_leakage(tr, va, te, require_subject_disjoint=True)
+    assert audit_subj["scan_disjoint"] is True
+    assert audit_subj["subject_disjoint"] is True
+    assert audit_subj["leakage_detected"] is False
+    assert audit_subj["subject_overlap_train_test"] == 0
 
-    assert len(tr_subjs & va_subjs) == 0, f"Leakage tr-va: {tr_subjs & va_subjs}"
-    assert len(tr_subjs & te_subjs) == 0, f"Leakage tr-te: {tr_subjs & te_subjs}"
-    assert len(va_subjs & te_subjs) == 0, f"Leakage va-te: {va_subjs & te_subjs}"
-    assert len(tr_subjs) + len(va_subjs) + len(te_subjs) == 12
+    # Verify longitudinal split is scan-disjoint but honestly reports shared longitudinal subjects
+    tr_l, va_l, te_l = _split_longitudinal_with_metadata(records, meta_file, seed=42)
+    audit_long = verify_no_patient_leakage(tr_l, va_l, te_l, require_subject_disjoint=False)
+    assert audit_long["scan_disjoint"] is True
+    assert audit_long["subject_disjoint"] is False
+    assert audit_long["leakage_detected"] is True
+    assert audit_long["subject_overlap_train_test"] > 0
+
+    # Verify require_subject_disjoint=True raises AssertionError on longitudinal split
+    with pytest.raises(AssertionError, match="SUBJECT LEAKAGE"):
+        verify_no_patient_leakage(tr_l, va_l, te_l, require_subject_disjoint=True)
 
 
 def test_selective_triage_routing_monotonicity() -> None:

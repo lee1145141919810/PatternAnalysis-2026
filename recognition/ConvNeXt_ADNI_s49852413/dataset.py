@@ -54,6 +54,7 @@ class SliceRecord:
     class_name: str
     patient_id: str
     slice_index: int
+    subject_id: Optional[str] = None
 
 
 def resolve_adni_root(data_root: Optional[str | Path] = None) -> Path:
@@ -223,11 +224,20 @@ def verify_no_patient_leakage(
     train_records: Sequence[SliceRecord],
     val_records: Sequence[SliceRecord],
     test_records: Sequence[SliceRecord],
+    require_subject_disjoint: bool = False,
 ) -> Dict[str, object]:
-    """Programmatically verify and summarize strict patient-level separation across splits.
+    """Programmatically verify and summarize both 3D scan-level and human subject-level separation.
+
+    Args:
+        train_records: Training split slice records.
+        val_records: Validation split slice records.
+        test_records: Test split slice records.
+        require_subject_disjoint: If True, asserts zero overlap at the human subject (`XXX_S_XXXX`) level
+            in addition to zero 3D scan (`Ixxxxxx`) overlap.
 
     Raises:
-        AssertionError: If any `patient_id` appears in more than one split.
+        AssertionError: If any 3D scan (`patient_id`) overlaps across splits, or if
+            `require_subject_disjoint=True` and any `subject_id` overlaps across splits.
     """
     p_train = {r.patient_id for r in train_records}
     p_val = {r.patient_id for r in val_records}
@@ -237,14 +247,31 @@ def verify_no_patient_leakage(
     overlap_tt = p_train & p_test
     overlap_vt = p_val & p_test
 
-    assert len(overlap_tv) == 0, f"CRITICAL DATA LEAKAGE: {len(overlap_tv)} patients in both train & val!"
-    assert len(overlap_tt) == 0, f"CRITICAL DATA LEAKAGE: {len(overlap_tt)} patients in both train & test!"
-    assert len(overlap_vt) == 0, f"CRITICAL DATA LEAKAGE: {len(overlap_vt)} patients in both val & test!"
+    assert len(overlap_tv) == 0, f"CRITICAL SCAN LEAKAGE: {len(overlap_tv)} scans in both train & val!"
+    assert len(overlap_tt) == 0, f"CRITICAL SCAN LEAKAGE: {len(overlap_tt)} scans in both train & test!"
+    assert len(overlap_vt) == 0, f"CRITICAL SCAN LEAKAGE: {len(overlap_vt)} scans in both val & test!"
+
+    s_train = {r.subject_id or r.patient_id for r in train_records}
+    s_val = {r.subject_id or r.patient_id for r in val_records}
+    s_test = {r.subject_id or r.patient_id for r in test_records}
+
+    subj_overlap_tv = s_train & s_val
+    subj_overlap_tt = s_train & s_test
+    subj_overlap_vt = s_val & s_test
+    subject_disjoint = (len(subj_overlap_tv) == 0 and len(subj_overlap_tt) == 0 and len(subj_overlap_vt) == 0)
+
+    if require_subject_disjoint:
+        assert len(subj_overlap_tv) == 0, f"SUBJECT LEAKAGE: {len(subj_overlap_tv)} subjects in both train & val!"
+        assert len(subj_overlap_tt) == 0, f"SUBJECT LEAKAGE: {len(subj_overlap_tt)} subjects in both train & test!"
+        assert len(subj_overlap_vt) == 0, f"SUBJECT LEAKAGE: {len(subj_overlap_vt)} subjects in both val & test!"
 
     def _split_stats(recs: Sequence[SliceRecord]) -> Dict[str, int]:
         pids = {r.patient_id for r in recs}
         ad_pids = {r.patient_id for r in recs if r.label == 1}
         nc_pids = {r.patient_id for r in recs if r.label == 0}
+        sids = {r.subject_id or r.patient_id for r in recs}
+        ad_sids = {r.subject_id or r.patient_id for r in recs if r.label == 1}
+        nc_sids = {r.subject_id or r.patient_id for r in recs if r.label == 0}
         ad_slices = sum(1 for r in recs if r.label == 1)
         nc_slices = sum(1 for r in recs if r.label == 0)
         return {
@@ -254,13 +281,21 @@ def verify_no_patient_leakage(
             "total_patients": len(pids),
             "ad_patients": len(ad_pids),
             "nc_patients": len(nc_pids),
+            "unique_subjects": len(sids),
+            "ad_subjects": len(ad_sids),
+            "nc_subjects": len(nc_sids),
         }
 
     return {
-        "leakage_detected": False,
+        "leakage_detected": not subject_disjoint,
+        "scan_disjoint": True,
+        "subject_disjoint": subject_disjoint,
         "overlap_train_val": len(overlap_tv),
         "overlap_train_test": len(overlap_tt),
         "overlap_val_test": len(overlap_vt),
+        "subject_overlap_train_val": len(subj_overlap_tv),
+        "subject_overlap_train_test": len(subj_overlap_tt),
+        "subject_overlap_val_test": len(subj_overlap_vt),
         "train": _split_stats(train_records),
         "val": _split_stats(val_records),
         "test": _split_stats(test_records),
@@ -334,8 +369,8 @@ class ADNIDataset(Dataset):
     def _apply_augmentations(img: np.ndarray) -> np.ndarray:
         """Apply anatomically valid sagittal brain MRI augmentations in [0, 1] float space.
 
-        Note: Sagittal slices have asymmetric anterior-posterior anatomy (frontal vs.
-        cerebellar/occipital lobes) and therefore must NOT be horizontally flipped.
+        Note: Sagittal slices have asymmetric anterior-posterior anatomy (frontal lobe vs.
+        cerebellum/occipital lobe) and therefore must NOT be horizontally flipped.
         """
         # 1. Mild sub-voxel spatial translation (+/- 2 pixels)
         if np.random.rand() < 0.5:
@@ -354,9 +389,10 @@ class ADNIDataset(Dataset):
     def standardize_slice(img: np.ndarray, use_cohort_stats: bool = False) -> np.ndarray:
         """Standardize slice intensities.
 
-        When `use_cohort_stats=True` (used for N4-bias-corrected skull-stripped ADNI scans),
-        normalizes by fixed cohort mean/std (`0.18`, `0.25`) so whole-brain tissue-to-ICV
-        volume ratios (cortical atrophy) are preserved rather than divided out.
+        When `use_cohort_stats=True` (used for the skull-stripped ADNI slices derived from
+        `ADNI_T1_3T_MASKED_N4`), normalizes by fixed training-split ROI constants (`0.18`, `0.25`;
+        empirical train-only ROI mean=0.2087, std=0.2682 in `results/protocol_audit.json`, test
+        strictly excluded) so whole-brain tissue-to-ICV volume ratios are preserved.
         When `use_cohort_stats=False` (default for standalone calls), applies per-slice
         zero-mean unit-variance Z-score standardization.
         """
@@ -391,11 +427,48 @@ class ADNIDataset(Dataset):
                 "index": idx,
                 "filepath": str(rec.filepath),
                 "patient_id": rec.patient_id,
+                "subject_id": rec.subject_id or rec.patient_id,
                 "slice_index": rec.slice_index,
                 "class_name": rec.class_name,
             }
             return tensor_img, label, meta
         return tensor_img, label
+
+
+def _scan_to_subject_map(
+    all_records: Sequence[SliceRecord],
+    meta_json_path: Path,
+    strict: bool = True,
+) -> Dict[str, str]:
+    """Map each 3D scan id (`patient_id`) to its ADNI subject id (`XXX_S_XXXX`) and populate `r.subject_id`.
+
+    Raises:
+        RuntimeError: If `strict=True` and any scan ID cannot be resolved to an ADNI subject ID.
+    """
+    import json
+
+    with open(meta_json_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    mapping: Dict[str, str] = {}
+    unmapped_scans: List[str] = []
+    for r in all_records:
+        if r.patient_id not in mapping:
+            raw_sid = r.patient_id.split("_")[-1]
+            raw_str = meta.get(raw_sid, {}).get("raw", "") if isinstance(meta, dict) else ""
+            m = re.search(r"(\d{3}_S_\d{4})", raw_str)
+            if m:
+                mapping[r.patient_id] = m.group(1)
+            else:
+                unmapped_scans.append(r.patient_id)
+                mapping[r.patient_id] = r.patient_id
+        object.__setattr__(r, "subject_id", mapping[r.patient_id])
+
+    if strict and len(unmapped_scans) > 0:
+        raise RuntimeError(
+            f"Failed to resolve {len(unmapped_scans)} scan IDs in {meta_json_path}: "
+            f"examples={unmapped_scans[:5]}"
+        )
+    return mapping
 
 
 def _split_longitudinal_with_metadata(
@@ -404,19 +477,15 @@ def _split_longitudinal_with_metadata(
     seed: int = 42,
     train_slice_stride: int = 2,
 ) -> Tuple[List[SliceRecord], List[SliceRecord], List[SliceRecord]]:
-    """Protocol-balanced longitudinal 3D scan split using `/home/groups/comp3710/ADNI/meta_data_with_label.json`.
+    """Within-subject longitudinal 3D scan split using `meta_data_with_label.json`.
 
-    Forensic inspection of `meta_data_with_label.json` reveals that the default `AD_NC/train`
-    and `AD_NC/test` folders partition scans by raw chronological Image ID (`I218391-I388204`
-    ADNI-2 MPRAGE in `train/AD` vs `I808819-I1442100` ADNI-3 IR-FSPGR in `train/NC`),
-    causing severe protocol confounding. This function groups 20-slice 3D scans (`Ixxxxxx`)
-    by ADNI subject (`XXX_S_XXXX`) and holds out balanced longitudinal follow-up scans for
-    `val` and `test` while keeping zero 3D scan overlap across all three splits.
+    Note on Subject Overlap: This split is 3D scan-disjoint (`scan_overlap = 0`) but intentionally
+    shares longitudinal subjects across train/val/test to evaluate within-subject follow-up tracking
+    (subjects with >= 4 scans in AD or >= 3 scans in NC have one intermediate follow-up scan held out
+    while earlier/later scans remain in training). For strict unseen-patient evaluation required by
+    Section 2.1, use `_split_subject_disjoint` (`split_mode="subject"`).
     """
-    import json
-
-    with open(meta_json_path, "r", encoding="utf-8") as f:
-        meta = json.load(f)
+    scan2subj = _scan_to_subject_map(all_records, meta_json_path, strict=True)
 
     by_scan: Dict[str, List[SliceRecord]] = defaultdict(list)
     for r in all_records:
@@ -424,10 +493,7 @@ def _split_longitudinal_with_metadata(
 
     subj_scans: Dict[str, List[str]] = defaultdict(list)
     for pid, recs in sorted(by_scan.items()):
-        raw_sid = pid.split("_")[-1]
-        raw_str = meta.get(raw_sid, {}).get("raw", "") if isinstance(meta, dict) else ""
-        m = re.search(r"(\d{3}_S_\d{4})", raw_str)
-        subj = f"{recs[0].class_name}_{m.group(1)}" if m else pid
+        subj = f"{recs[0].class_name}_{scan2subj[pid]}"
         subj_scans[subj].append(pid)
 
     rng = np.random.RandomState(seed)
@@ -465,23 +531,6 @@ def _split_longitudinal_with_metadata(
     return train_records, val_records, test_records
 
 
-def _scan_to_subject_map(all_records: Sequence[SliceRecord], meta_json_path: Path) -> Dict[str, str]:
-    """Map each 3D scan id (`patient_id`) to its ADNI subject id (`XXX_S_XXXX`), label-agnostic."""
-    import json
-
-    with open(meta_json_path, "r", encoding="utf-8") as f:
-        meta = json.load(f)
-    mapping: Dict[str, str] = {}
-    for r in all_records:
-        if r.patient_id in mapping:
-            continue
-        raw_sid = r.patient_id.split("_")[-1]
-        raw_str = meta.get(raw_sid, {}).get("raw", "") if isinstance(meta, dict) else ""
-        m = re.search(r"(\d{3}_S_\d{4})", raw_str)
-        mapping[r.patient_id] = m.group(1) if m else r.patient_id
-    return mapping
-
-
 def _split_subject_disjoint(
     all_records: Sequence[SliceRecord],
     meta_json_path: Path,
@@ -493,9 +542,10 @@ def _split_subject_disjoint(
     """Strictly subject-disjoint split: every ADNI subject (`XXX_S_XXXX`) lives in exactly one split.
 
     Subjects are grouped regardless of diagnostic label, stratified by their majority label,
-    and allocated ~70/15/15 by subject. This measures generalisation to *unseen patients*.
+    and allocated ~70/15/15 by subject. This measures generalisation to *unseen patients*
+    in full compliance with Section 2.1 ("all slices/lesions from one patient reside strictly in one split").
     """
-    scan2subj = _scan_to_subject_map(all_records, meta_json_path)
+    scan2subj = _scan_to_subject_map(all_records, meta_json_path, strict=True)
     subj_labels: Dict[str, List[int]] = defaultdict(list)
     for r in all_records:
         subj_labels[scan2subj[r.patient_id]].append(r.label)
@@ -528,22 +578,22 @@ def build_adni_dataloaders(
     num_workers: int = 0,
     max_samples_per_split: Optional[int] = None,
     return_meta_eval: bool = False,
-    split_mode: str = "longitudinal",
+    split_mode: str = "subject",
 ) -> Tuple[DataLoader, DataLoader, DataLoader, Dict[str, object]]:
-    """Construct leakage-free train, validation, and test DataLoaders for ADNI MRI.
+    """Construct train, validation, and test DataLoaders for ADNI MRI with full subject/scan audit.
 
     Args:
         data_root: Path to ADNI root (or None to auto-discover).
         image_size: Spatial resolution (H = W = image_size).
         batch_size: Mini-batch size.
-        val_fraction: Patient fraction from `train/` assigned to `val` if metadata is absent.
+        val_fraction: Patient fraction allocated to `val`.
         seed: Random seed for reproducible patient/scan-level split.
         num_workers: PyTorch DataLoader worker count.
         max_samples_per_split: Optional cap for rapid smoke-testing.
         return_meta_eval: Whether val/test datasets return slice metadata dicts.
-        split_mode: `"longitudinal"` (scan-disjoint, subjects shared across splits),
-            `"subject"` (strictly subject-disjoint), or `"official"` (folder train/test).
-            Metadata-based modes fall back to `"official"` if the JSON is unavailable.
+        split_mode: `"subject"` (default; strictly subject-disjoint, zero subject overlap),
+            `"longitudinal"` (scan-disjoint, shared longitudinal subjects across splits), or
+            `"official"` (raw `train/` and `test/` folder partition).
 
     Returns:
         `(train_loader, val_loader, test_loader, audit_summary)`
@@ -560,40 +610,47 @@ def build_adni_dataloaders(
     ]
     meta_path = next((p for p in meta_candidates if p.is_file()), None)
 
-    use_meta = (
-        split_mode != "official"
-        and meta_path is not None
+    has_full_meta = (
+        meta_path is not None
         and len(raw_train_records) + len(raw_test_records) >= 10000
     )
-    if use_meta and split_mode == "subject":
+    if has_full_meta and split_mode == "subject":
         all_records = raw_train_records + raw_test_records
         train_records, val_records, test_records = _split_subject_disjoint(
             all_records, meta_path, seed=seed, val_fraction=val_fraction, train_slice_stride=2
         )
-    elif use_meta:
+        require_subj_disjoint = True
+    elif has_full_meta and split_mode == "longitudinal":
         all_records = raw_train_records + raw_test_records
         train_records, val_records, test_records = _split_longitudinal_with_metadata(
             all_records, meta_path, seed=seed, train_slice_stride=2
         )
+        require_subj_disjoint = False
     else:
         test_pids = {r.patient_id for r in raw_test_records}
         if any(r.patient_id in test_pids for r in raw_train_records):
             raw_train_records = scan_split_directory(resolved_root / "train", split_tag="tr")
             raw_test_records = scan_split_directory(resolved_root / "test", split_tag="te")
+        if has_full_meta and meta_path is not None:
+            _scan_to_subject_map(raw_train_records + raw_test_records, meta_path, strict=True)
         train_records, val_records = split_patients_stratified(
             raw_train_records, val_fraction=val_fraction, seed=seed
         )
         test_records = raw_test_records
+        require_subj_disjoint = (split_mode == "subject")
 
     if max_samples_per_split is not None:
         train_records = train_records[:max_samples_per_split]
         val_records = val_records[: max(16, max_samples_per_split // 3)]
         test_records = test_records[: max(16, max_samples_per_split // 2)]
 
-    audit = verify_no_patient_leakage(train_records, val_records, test_records)
+    audit = verify_no_patient_leakage(
+        train_records, val_records, test_records, require_subject_disjoint=require_subj_disjoint
+    )
     audit["resolved_root"] = str(resolved_root)
     audit["image_size"] = image_size
     audit["metadata_json_used"] = str(meta_path) if meta_path is not None else None
+    audit["split_mode"] = split_mode
 
     train_ds = ADNIDataset(train_records, image_size=image_size, augment=True, return_meta=False)
     val_ds = ADNIDataset(val_records, image_size=image_size, augment=False, return_meta=return_meta_eval)
@@ -615,8 +672,7 @@ def build_adni_dataloaders(
 if __name__ == "__main__":
     import json
 
-    tr_loader, va_loader, te_loader, audit_info = build_adni_dataloaders(image_size=128, batch_size=32)
-    print("=== ADNI Data Hygiene & Patient-Level Split Audit ===")
-    print(json.dumps(audit_info, indent=2))
-    xb, yb = next(iter(tr_loader))
-    print(f"Sample train batch shape: images={tuple(xb.shape)}, labels={tuple(yb.shape)}")
+    for mode in ("subject", "longitudinal", "official"):
+        _, _, _, audit_info = build_adni_dataloaders(image_size=96, batch_size=32, split_mode=mode)
+        print(f"=== ADNI Split Audit ({mode}) ===")
+        print(json.dumps(audit_info, indent=2))
