@@ -62,7 +62,9 @@
         "latency_batch_size": 128,
         "single_slice_latency_ms": 0.339243033333266,
         "batched_per_slice_latency_ms": 0.029571744791667687,
-        "throughput_slices_per_sec": 33816.063510793116
+        "throughput_slices_per_sec": 33816.063510793116,
+        "steady_state_tensor_memory_mb": 4.67,
+        "memory_telemetry_metric": "mps_current_allocated_post_backward_steady_state_mb"
       },
       "val_metrics": {
         "accuracy": 0.7658333333333334,
@@ -95,6 +97,7 @@
         "temperature": 0.7584064602851868,
         "triage_prob_source": "temperature_scaled",
         "selected_tau": 0.75,
+        "selected_scan_tau": 0.6,
         "operating_point_slice": {
           "threshold": 0.75,
           "coverage": 0.5491666666666667,
@@ -106,6 +109,16 @@
           "system_hybrid_accuracy": 0.9266666666666666
         },
         "operating_point_scan": {
+          "threshold": 0.6,
+          "coverage": 0.8,
+          "referral_rate": 0.19999999999999996,
+          "accepted_accuracy": 0.8541666666666666,
+          "accepted_fn_rate": 0.038461538461538464,
+          "unflagged_missed_ad_fraction": 0.03333333333333333,
+          "intercepted_fn_fraction": 0.6666666666666666,
+          "system_hybrid_accuracy": 0.8833333333333333
+        },
+        "operating_point_scan_at_slice_tau": {
           "threshold": 0.75,
           "coverage": 0.5333333333333333,
           "referral_rate": 0.4666666666666667,
@@ -115,6 +128,79 @@
           "intercepted_fn_fraction": 0.6666666666666666,
           "system_hybrid_accuracy": 0.95
         },
+        "era_stratified": {
+          "pre_2017_adni2": {
+            "num_slices": 560,
+            "num_scans": 28,
+            "ad_slices": 560,
+            "nc_slices": 0,
+            "slice_accuracy": 0.8768,
+            "balanced_accuracy": 0.4384,
+            "ad_recall": 0.8768,
+            "nc_recall": 0.0,
+            "auroc": 0.0,
+            "scan_accuracy": 0.8929
+          },
+          "post_2017_adni3": {
+            "num_slices": 640,
+            "num_scans": 32,
+            "ad_slices": 40,
+            "nc_slices": 600,
+            "slice_accuracy": 0.6687,
+            "balanced_accuracy": 0.8,
+            "ad_recall": 0.95,
+            "nc_recall": 0.65,
+            "auroc": 0.8589,
+            "scan_accuracy": 0.7188
+          }
+        },
+        "slice_position_quintiles": [
+          {
+            "quintile": 1,
+            "rel_pos_range": "[0.0, 0.2)",
+            "num_slices": 240,
+            "accuracy": 0.7417,
+            "fn_rate_on_ad": 0.075,
+            "fp_rate_on_nc": 0.4417,
+            "mean_confidence": 0.7691
+          },
+          {
+            "quintile": 2,
+            "rel_pos_range": "[0.2, 0.4)",
+            "num_slices": 240,
+            "accuracy": 0.7667,
+            "fn_rate_on_ad": 0.125,
+            "fp_rate_on_nc": 0.3417,
+            "mean_confidence": 0.7589
+          },
+          {
+            "quintile": 3,
+            "rel_pos_range": "[0.4, 0.6)",
+            "num_slices": 240,
+            "accuracy": 0.7833,
+            "fn_rate_on_ad": 0.075,
+            "fp_rate_on_nc": 0.3583,
+            "mean_confidence": 0.7512
+          },
+          {
+            "quintile": 4,
+            "rel_pos_range": "[0.6, 0.8)",
+            "num_slices": 240,
+            "accuracy": 0.8083,
+            "fn_rate_on_ad": 0.15,
+            "fp_rate_on_nc": 0.2333,
+            "mean_confidence": 0.7564
+          },
+          {
+            "quintile": 5,
+            "rel_pos_range": "[0.8, 1.0]",
+            "num_slices": 240,
+            "accuracy": 0.7292,
+            "fn_rate_on_ad": 0.1667,
+            "fp_rate_on_nc": 0.375,
+            "mean_confidence": 0.7738
+          }
+        ],
         "ece_uncalibrated": 0.04869247083862622,
         "ece_calibrated": 0.025337759057680775,
         "brier_uncalibrated": 0.1662813562904128,
@@ -130,6 +216,11 @@
           "scan_mean_prob_accuracy": 0.8,
           "scan_majority_vote_accuracy": 0.8,
           "scan_acc_ci95": [
+            0.6996,
+            0.9
+          ],
+          "scan_acc_ci95_method": "subject_cluster_bootstrap_1000",
+          "scan_acc_iid_ci95": [
             0.7,
             0.9
           ],
@@ -457,6 +548,7 @@
         "temperature": 0.7584064602851868,
         "triage_prob_source": "temperature_scaled",
         "selected_tau": 0.75,
+        "selected_scan_tau": 0.6,
         "operating_point_slice": {
           "threshold": 0.75,
           "coverage": 0.5862903225806452,
@@ -468,6 +560,16 @@
           "system_hybrid_accuracy": 0.9637096774193549
         },
         "operating_point_scan": {
+          "threshold": 0.6,
+          "coverage": 0.7741935483870968,
+          "referral_rate": 0.22580645161290325,
+          "accepted_accuracy": 0.9583333333333334,
+          "accepted_fn_rate": 0.0,
+          "unflagged_missed_ad_fraction": 0.0,
+          "intercepted_fn_fraction": 1.0,
+          "system_hybrid_accuracy": 0.967741935483871
+        },
+        "operating_point_scan_at_slice_tau": {
           "threshold": 0.75,
           "coverage": 0.5161290322580645,
           "referral_rate": 0.4838709677419355,
@@ -477,6 +579,79 @@
           "intercepted_fn_fraction": 1.0,
           "system_hybrid_accuracy": 0.9838709677419355
         },
+        "era_stratified": {
+          "pre_2017_adni2": {
+            "num_slices": 580,
+            "num_scans": 29,
+            "ad_slices": 580,
+            "nc_slices": 0,
+            "slice_accuracy": 0.9155,
+            "balanced_accuracy": 0.4578,
+            "ad_recall": 0.9155,
+            "nc_recall": 0.0,
+            "auroc": 0.0,
+            "scan_accuracy": 0.9655
+          },
+          "post_2017_adni3": {
+            "num_slices": 660,
+            "num_scans": 33,
+            "ad_slices": 40,
+            "nc_slices": 620,
+            "slice_accuracy": 0.7591,
+            "balanced_accuracy": 0.7899,
+            "ad_recall": 0.825,
+            "nc_recall": 0.7548,
+            "auroc": 0.8948,
+            "scan_accuracy": 0.8485
+          }
+        },
+        "slice_position_quintiles": [
+          {
+            "quintile": 1,
+            "rel_pos_range": "[0.0, 0.2)",
+            "num_slices": 248,
+            "accuracy": 0.8468,
+            "fn_rate_on_ad": 0.0484,
+            "fp_rate_on_nc": 0.2581,
+            "mean_confidence": 0.7821
+          },
+          {
+            "quintile": 2,
+            "rel_pos_range": "[0.2, 0.4)",
+            "num_slices": 248,
+            "accuracy": 0.8589,
+            "fn_rate_on_ad": 0.0887,
+            "fp_rate_on_nc": 0.1935,
+            "mean_confidence": 0.7728
+          },
+          {
+            "quintile": 3,
+            "rel_pos_range": "[0.4, 0.6)",
+            "num_slices": 248,
+            "accuracy": 0.7903,
+            "fn_rate_on_ad": 0.1532,
+            "fp_rate_on_nc": 0.2661,
+            "mean_confidence": 0.7322
+          },
+          {
+            "quintile": 4,
+            "rel_pos_range": "[0.6, 0.8)",
+            "num_slices": 248,
+            "accuracy": 0.8427,
+            "fn_rate_on_ad": 0.0887,
+            "fp_rate_on_nc": 0.2258,
+            "mean_confidence": 0.7526
+          },
+          {
+            "quintile": 5,
+            "rel_pos_range": "[0.8, 1.0]",
+            "num_slices": 248,
+            "accuracy": 0.8226,
+            "fn_rate_on_ad": 0.0726,
+            "fp_rate_on_nc": 0.2823,
+            "mean_confidence": 0.7917
+          }
+        ],
         "ece_uncalibrated": 0.11175097731813309,
         "ece_calibrated": 0.0683975341339265,
         "brier_uncalibrated": 0.13514758713241457,
@@ -492,6 +667,11 @@
           "scan_mean_prob_accuracy": 0.9032258064516129,
           "scan_majority_vote_accuracy": 0.9032258064516129,
           "scan_acc_ci95": [
+            0.8226,
+            0.9677
+          ],
+          "scan_acc_ci95_method": "subject_cluster_bootstrap_1000",
+          "scan_acc_iid_ci95": [
             0.8226,
             0.9677
           ],
@@ -800,7 +980,9 @@
         "latency_batch_size": 128,
         "single_slice_latency_ms": 1.4623583333332135,
         "batched_per_slice_latency_ms": 0.34089778645833846,
-        "throughput_slices_per_sec": 2933.4306050773116
+        "throughput_slices_per_sec": 2933.4306050773116,
+        "steady_state_tensor_memory_mb": 41.9,
+        "memory_telemetry_metric": "mps_current_allocated_post_backward_steady_state_mb"
       },
       "val_metrics": {
         "accuracy": 0.8341666666666666,
@@ -833,6 +1015,7 @@
         "temperature": 1.730758786201477,
         "triage_prob_source": "temperature_scaled",
         "selected_tau": 0.8,
+        "selected_scan_tau": 0.6,
         "operating_point_slice": {
           "threshold": 0.8,
           "coverage": 0.6425,
@@ -844,6 +1027,16 @@
           "system_hybrid_accuracy": 0.9308333333333333
         },
         "operating_point_scan": {
+          "threshold": 0.6,
+          "coverage": 0.8666666666666667,
+          "referral_rate": 0.1333333333333333,
+          "accepted_accuracy": 0.9230769230769231,
+          "accepted_fn_rate": 0.041666666666666664,
+          "unflagged_missed_ad_fraction": 0.03333333333333333,
+          "intercepted_fn_fraction": 0.75,
+          "system_hybrid_accuracy": 0.9333333333333333
+        },
+        "operating_point_scan_at_slice_tau": {
           "threshold": 0.8,
           "coverage": 0.55,
           "referral_rate": 0.44999999999999996,
@@ -853,6 +1046,79 @@
           "intercepted_fn_fraction": 1.0,
           "system_hybrid_accuracy": 0.9666666666666667
         },
+        "era_stratified": {
+          "pre_2017_adni2": {
+            "num_slices": 560,
+            "num_scans": 28,
+            "ad_slices": 560,
+            "nc_slices": 0,
+            "slice_accuracy": 0.8268,
+            "balanced_accuracy": 0.4134,
+            "ad_recall": 0.8268,
+            "nc_recall": 0.0,
+            "auroc": 0.0,
+            "scan_accuracy": 0.8571
+          },
+          "post_2017_adni3": {
+            "num_slices": 640,
+            "num_scans": 32,
+            "ad_slices": 40,
+            "nc_slices": 600,
+            "slice_accuracy": 0.8406,
+            "balanced_accuracy": 0.8917,
+            "ad_recall": 0.95,
+            "nc_recall": 0.8333,
+            "auroc": 0.9261,
+            "scan_accuracy": 0.8438
+          }
+        },
+        "slice_position_quintiles": [
+          {
+            "quintile": 1,
+            "rel_pos_range": "[0.0, 0.2)",
+            "num_slices": 240,
+            "accuracy": 0.8583,
+            "fn_rate_on_ad": 0.1167,
+            "fp_rate_on_nc": 0.1667,
+            "mean_confidence": 0.8207
+          },
+          {
+            "quintile": 2,
+            "rel_pos_range": "[0.2, 0.4)",
+            "num_slices": 240,
+            "accuracy": 0.85,
+            "fn_rate_on_ad": 0.125,
+            "fp_rate_on_nc": 0.175,
+            "mean_confidence": 0.8103
+          },
+          {
+            "quintile": 3,
+            "rel_pos_range": "[0.4, 0.6)",
+            "num_slices": 240,
+            "accuracy": 0.8375,
+            "fn_rate_on_ad": 0.1417,
+            "fp_rate_on_nc": 0.1833,
+            "mean_confidence": 0.8233
+          },
+          {
+            "quintile": 4,
+            "rel_pos_range": "[0.6, 0.8)",
+            "num_slices": 240,
+            "accuracy": 0.8125,
+            "fn_rate_on_ad": 0.2167,
+            "fp_rate_on_nc": 0.1583,
+            "mean_confidence": 0.8149
+          },
+          {
+            "quintile": 5,
+            "rel_pos_range": "[0.8, 1.0]",
+            "num_slices": 240,
+            "accuracy": 0.8125,
+            "fn_rate_on_ad": 0.225,
+            "fp_rate_on_nc": 0.15,
+            "mean_confidence": 0.8254
+          }
+        ],
         "ece_uncalibrated": 0.09298990006248156,
         "ece_calibrated": 0.0328683006266753,
         "brier_uncalibrated": 0.13751536105658763,
@@ -871,12 +1137,17 @@
             0.75,
             0.9333
           ],
+          "scan_acc_ci95_method": "subject_cluster_bootstrap_1000",
+          "scan_acc_iid_ci95": [
+            0.7663,
+            0.9333
+          ],
           "patient_macro_f1": 0.8499583217560434,
           "patient_auroc": 0.9333333333333333,
           "num_patients": 60,
           "subject_accuracy": 0.85,
           "subject_acc_ci95": [
-            0.75,
+            0.7667,
             0.9333
           ],
           "subject_macro_f1": 0.8499583217560434,
@@ -1195,6 +1466,7 @@
         "temperature": 1.730758786201477,
         "triage_prob_source": "temperature_scaled",
         "selected_tau": 0.8,
+        "selected_scan_tau": 0.6,
         "operating_point_slice": {
           "threshold": 0.8,
           "coverage": 0.5862903225806452,
@@ -1206,6 +1478,16 @@
           "system_hybrid_accuracy": 0.9661290322580646
         },
         "operating_point_scan": {
+          "threshold": 0.6,
+          "coverage": 0.8225806451612904,
+          "referral_rate": 0.17741935483870963,
+          "accepted_accuracy": 1.0,
+          "accepted_fn_rate": 0.0,
+          "unflagged_missed_ad_fraction": 0.0,
+          "intercepted_fn_fraction": 1.0,
+          "system_hybrid_accuracy": 1.0
+        },
+        "operating_point_scan_at_slice_tau": {
           "threshold": 0.8,
           "coverage": 0.43548387096774194,
           "referral_rate": 0.564516129032258,
@@ -1215,6 +1497,79 @@
           "intercepted_fn_fraction": 1.0,
           "system_hybrid_accuracy": 1.0
         },
+        "era_stratified": {
+          "pre_2017_adni2": {
+            "num_slices": 580,
+            "num_scans": 29,
+            "ad_slices": 580,
+            "nc_slices": 0,
+            "slice_accuracy": 0.8466,
+            "balanced_accuracy": 0.4233,
+            "ad_recall": 0.8466,
+            "nc_recall": 0.0,
+            "auroc": 0.0,
+            "scan_accuracy": 0.9655
+          },
+          "post_2017_adni3": {
+            "num_slices": 660,
+            "num_scans": 33,
+            "ad_slices": 40,
+            "nc_slices": 620,
+            "slice_accuracy": 0.8939,
+            "balanced_accuracy": 0.9202,
+            "ad_recall": 0.95,
+            "nc_recall": 0.8903,
+            "auroc": 0.9576,
+            "scan_accuracy": 0.9091
+          }
+        },
+        "slice_position_quintiles": [
+          {
+            "quintile": 1,
+            "rel_pos_range": "[0.0, 0.2)",
+            "num_slices": 248,
+            "accuracy": 0.879,
+            "fn_rate_on_ad": 0.1371,
+            "fp_rate_on_nc": 0.1048,
+            "mean_confidence": 0.8325
+          },
+          {
+            "quintile": 2,
+            "rel_pos_range": "[0.2, 0.4)",
+            "num_slices": 248,
+            "accuracy": 0.8871,
+            "fn_rate_on_ad": 0.129,
+            "fp_rate_on_nc": 0.0968,
+            "mean_confidence": 0.7953
+          },
+          {
+            "quintile": 3,
+            "rel_pos_range": "[0.4, 0.6)",
+            "num_slices": 248,
+            "accuracy": 0.8347,
+            "fn_rate_on_ad": 0.1855,
+            "fp_rate_on_nc": 0.1452,
+            "mean_confidence": 0.7736
+          },
+          {
+            "quintile": 4,
+            "rel_pos_range": "[0.6, 0.8)",
+            "num_slices": 248,
+            "accuracy": 0.8548,
+            "fn_rate_on_ad": 0.1855,
+            "fp_rate_on_nc": 0.1048,
+            "mean_confidence": 0.8065
+          },
+          {
+            "quintile": 5,
+            "rel_pos_range": "[0.8, 1.0]",
+            "num_slices": 248,
+            "accuracy": 0.9032,
+            "fn_rate_on_ad": 0.0968,
+            "fp_rate_on_nc": 0.0968,
+            "mean_confidence": 0.8024
+          }
+        ],
         "ece_uncalibrated": 0.03619758856873357,
         "ece_calibrated": 0.06978368687052879,
         "brier_uncalibrated": 0.10130985156708523,
@@ -1230,6 +1585,11 @@
           "scan_mean_prob_accuracy": 0.9354838709677419,
           "scan_majority_vote_accuracy": 0.9354838709677419,
           "scan_acc_ci95": [
+            0.871,
+            0.9839
+          ],
+          "scan_acc_ci95_method": "subject_cluster_bootstrap_1000",
+          "scan_acc_iid_ci95": [
             0.871,
             0.9839
           ],

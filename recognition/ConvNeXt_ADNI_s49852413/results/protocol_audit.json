@@ -18,6 +18,9 @@
         "year_min": 2011,
         "year_median": 2012,
         "year_max": 2013,
+        "era_counts": {
+          "pre_2017_ADNI2": 520
+        },
         "protocol_counts": {
           "ADNI2_Standard_Sagittal_MPRAGE": 353,
           "ADNI3_Accelerated_Sag_IR-FSPGR": 49,
@@ -33,6 +36,9 @@
         "year_min": 2017,
         "year_median": 2018,
         "year_max": 2021,
+        "era_counts": {
+          "post_2017_ADNI3": 553
+        },
         "protocol_counts": {
           "ADNI2_Standard_Sagittal_MPRAGE": 68,
           "ADNI3_Accelerated_Sag_IR-FSPGR": 111,
@@ -57,6 +63,10 @@
         "year_min": 2013,
         "year_median": 2018,
         "year_max": 2021,
+        "era_counts": {
+          "post_2017_ADNI3": 119,
+          "pre_2017_ADNI2": 103
+        },
         "protocol_counts": {
           "ADNI2_Standard_Sagittal_MPRAGE": 81,
           "ADNI3_Accelerated_Sag_IR-FSPGR": 50,
@@ -73,6 +83,9 @@
         "year_min": 2019,
         "year_median": 2020,
         "year_max": 2021,
+        "era_counts": {
+          "post_2017_ADNI3": 226
+        },
         "protocol_counts": {
           "ADNI2_Standard_Sagittal_MPRAGE": 21,
           "ADNI3_Accelerated_Sag_IR-FSPGR": 50,
@@ -89,8 +102,17 @@
   },
   "train_only_intensity_statistics": {
     "cropped_roi": "[16:208, 48:224]",
-    "computed_on": "1000 random slices from official_train only (test strictly excluded)",
-    "mean": 0.2087,
-    "std": 0.2682
+    "fixed_pipeline_shift_scale": [
+      0.18,
+      0.25
+    ],
+    "official_train_1000_slice_sample": {
+      "mean": 0.2087,
+      "std": 0.2682
+    },
+    "subject_disjoint_train_1000_slice_sample_seed42": {
+      "mean": 0.2108,
+      "std": 0.2693
+    }
   }
 }
