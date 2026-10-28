@@ -507,6 +507,7 @@ def train_single_model(
     weight_decay: float = 1e-2,
     image_size: int = 96,
     seed: int = 42,
+    save_checkpoint: bool = True,
 ) -> Dict[str, object]:
     """Train, validate, calibrate, and benchmark a single model architecture under identical hyperparameters."""
     set_global_seed(seed)
@@ -636,18 +637,19 @@ def train_single_model(
     # Save checkpoint to git-ignored checkpoints/ directory
     CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
     ckpt_path = CHECKPOINTS_DIR / f"{model_name}_best.pt"
-    torch.save(
-        {
-            "model_name": model_name,
-            "best_epoch": best_epoch,
-            "temperature": optimal_temp,
-            "use_calibrated_for_triage": use_cal_for_triage,
-            "val_selected_tau": val_selected_tau,
-            "image_size": image_size,
-            "state_dict": model.state_dict(),
-        },
-        ckpt_path,
-    )
+    if save_checkpoint:
+        torch.save(
+            {
+                "model_name": model_name,
+                "best_epoch": best_epoch,
+                "temperature": optimal_temp,
+                "use_calibrated_for_triage": use_cal_for_triage,
+                "val_selected_tau": val_selected_tau,
+                "image_size": image_size,
+                "state_dict": model.state_dict(),
+            },
+            ckpt_path,
+        )
 
     # Final evaluation on held-out test set using validation-selected tau*
     test_logits, test_labels, test_metas = collect_logits_and_labels(model, test_loader, device)
@@ -1135,6 +1137,7 @@ def main() -> None:
                 weight_decay=args.weight_decay,
                 image_size=args.image_size,
                 seed=current_seed,
+                save_checkpoint=(idx == 0),
             )
             results_by_model[m_name] = res
 

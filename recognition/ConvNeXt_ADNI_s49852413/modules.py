@@ -226,26 +226,25 @@ class ConvNeXt(nn.Module):
 
 
 class SimpleCNNBaseline(nn.Module):
-    """4-Stage Standard Convolutional Neural Network Baseline for ADNI AD vs. NC screening.
+    """3-Stage Standard Convolutional Neural Network Baseline with BatchNorm2d for ADNI Screening.
 
-    Serves as a fair, matched-depth Section 2.1 baseline benchmark using conventional 3x3
-    dense convolutions, `BatchNorm2d`, `ReLU` activations, and 2x2 `MaxPool2d` across 4 stages
-    (`96x96 -> 48x48 -> 24x24 -> 12x12 -> 6x6`, channels `16 -> 32 -> 64 -> 128`, ~106K params),
-    without residual connections, 7x7 depthwise mixing, inverted bottlenecks, or `LayerNorm2d`.
+    Upgrades the original 3-stage baseline (`8 -> 16 -> 32`, `3x3` Conv + `ReLU` + `2x2` `MaxPool2d`
+    followed by `AdaptiveAvgPool2d((1, 1))`, 6,018 parameters) with `BatchNorm2d` after every
+    convolution and identical `AdamW` weight decay (`1e-2`), isolating the architectural effect
+    of ConvNeXt's 7x7 depthwise convolutions, inverted bottlenecks, and `LayerNorm2d`.
     """
 
     def __init__(
         self,
         in_channels: int = 1,
         num_classes: int = 2,
-        base_channels: int = 16,
+        base_channels: int = 8,
         dropout: float = 0.25,
     ) -> None:
         super().__init__()
         c1 = base_channels
         c2 = base_channels * 2
         c3 = base_channels * 4
-        c4 = base_channels * 8
 
         self.features = nn.Sequential(
             # Stage 1: 96x96 -> 48x48
@@ -263,17 +262,12 @@ class SimpleCNNBaseline(nn.Module):
             nn.BatchNorm2d(c3),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
-            # Stage 4: 12x12 -> 6x6
-            nn.Conv2d(c3, c4, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(c4),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
         )
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Dropout(p=dropout),
-            nn.Linear(c4, c3),
+            nn.Linear(c3, c3),
             nn.ReLU(inplace=True),
             nn.Linear(c3, num_classes),
         )

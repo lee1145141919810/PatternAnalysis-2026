@@ -636,7 +636,7 @@ def main() -> None:
     print(f"Dataset Root        : {audit['resolved_root']}")
     print(
         f"Held-Out Test Split : {audit['test']['total_slices']} slices "
-        f"({audit['test']['total_patients']} scans, {audit['test']['total_subjects']} subjects)"
+        f"({audit['test']['total_patients']} scans, {audit['test']['unique_subjects']} subjects)"
     )
     print(f"Slice-Level Accuracy: {metrics['accuracy'] * 100:.2f}%")
     print(f"Scan Mean-Prob Acc  : {metrics['patient_level'].get('scan_mean_prob_accuracy', 0.0) * 100:.2f}%")
