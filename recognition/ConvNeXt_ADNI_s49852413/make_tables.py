@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -57,12 +58,35 @@ def generate_table_3_0a(audit: Dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _mean_sd(values: List[float]) -> Tuple[float, float]:
+    """Sample mean and unbiased (ddof=1) standard deviation."""
+    n = len(values)
+    mu = sum(values) / n
+    var = sum((v - mu) ** 2 for v in values) / (n - 1) if n > 1 else 0.0
+    return mu, var ** 0.5
+
+
+def _paired_from_values(base_vals: List[float], conv_vals: List[float]) -> Tuple[float, float]:
+    """Paired per-seed difference (baseline - convnext), mean and SD (ddof=1)."""
+    return _mean_sd([b - c for b, c in zip(base_vals, conv_vals)])
+
+
+def paired_t_pvalue_df2(diffs: List[float]) -> Tuple[float, float]:
+    """Two-sided paired t-test for n = 3 seeds (df = 2), using the exact closed-form
+    Student-t CDF for two degrees of freedom: p = 1 - |t| / sqrt(t^2 + 2)."""
+    if len(diffs) != 3:
+        raise ValueError("Closed-form p-value is only implemented for n = 3 (df = 2).")
+    mu, sd = _mean_sd(diffs)
+    t_stat = mu / (sd / (3 ** 0.5))
+    p_val = 1.0 - abs(t_stat) / ((t_stat ** 2 + 2.0) ** 0.5)
+    return t_stat, p_val
+
+
 def generate_table_3_1a(b3: Dict[str, object], bs: Dict[str, object]) -> str:
     """Format Table 3.1A directly from `benchmark_subject_3seeds.json` and `benchmark_subject.json`."""
     agg = b3["aggregated"]
     base = agg["baseline"]
     conv = agg["convnext"]
-    pair = agg["paired_baseline_minus_convnext"]
 
     bs_base = bs["models"]["baseline"]["test_metrics"]
     bs_conv = bs["models"]["convnext"]["test_metrics"]
@@ -73,24 +97,46 @@ def generate_table_3_1a(b3: Dict[str, object], bs: Dict[str, object]) -> str:
     def _dec(d: Dict[str, float]) -> str:
         return f"{d['mean']:.4f} ± {d['std']:.4f}"
 
+    def _pdiff_pct(level: str, key: str) -> str:
+        mu, sd = _paired_from_values(base[level][key]["values"], conv[level][key]["values"])
+        return f"{mu * 100:+.2f}% ± {sd * 100:.2f}%"
+
+    def _pdiff_dec(level: str, key: str) -> str:
+        mu, sd = _paired_from_values(base[level][key]["values"], conv[level][key]["values"])
+        return f"{mu:+.4f} ± {sd:.4f}"
+
+    def _slice_count(tm: Dict[str, object]) -> str:
+        cm = tm["confusion_matrix"]
+        correct = cm[0][0] + cm[1][1]
+        total = sum(sum(row) for row in cm)
+        return f"{correct:,}/{total:,}"
+
+    def _scan_count(tm: Dict[str, object]) -> str:
+        pl = tm["patient_level"]
+        n = int(pl["num_patients"])
+        return f"{round(pl['scan_majority_vote_accuracy'] * n)}/{n}"
+
     b_s42_ci = bs_base["patient_level"]["scan_acc_ci95"]
     c_s42_ci = bs_conv["patient_level"]["scan_acc_ci95"]
     b_sub_ci = bs_base["patient_level"]["subject_acc_ci95"]
     c_sub_ci = bs_conv["patient_level"]["subject_acc_ci95"]
+    c_ece_raw = conv["slice_level"]["ece_uncalibrated"]["mean"]
+    c_ece_cal = conv["slice_level"]["ece_calibrated"]["mean"]
+    ece_red = (c_ece_cal - c_ece_raw) / c_ece_raw * 100.0
 
     lines = [
         "| Evaluation Metric | `SimpleCNNBaseline` (Seed 42 `[Cluster 95% CI]`) | `SimpleCNNBaseline` (3-Seed `Mean ± SD`, `ddof=1`) | `ConvNeXt` `[Hard]` (Seed 42 `[Cluster 95% CI]`) | `ConvNeXt` `[Hard]` (3-Seed `Mean ± SD`, `ddof=1`) | Paired Diff (`Baseline - ConvNeXt`, `ddof=1`) |",
         "| :--- | :---: | :---: | :---: | :---: | :---: |",
-        f"| **Slice Test Accuracy** | `{bs_base['accuracy'] * 100:.2f}%` (`3,414/4,780`) | **`{_pct(base['slice_level']['accuracy'])}`** | `{bs_conv['accuracy'] * 100:.2f}%` (`3,152/4,780`) | `{_pct(conv['slice_level']['accuracy'])}` | **`+{pair['slice_accuracy']['mean_diff_baseline_minus_convnext'] * 100:.2f}% ± {pair['slice_accuracy']['std_diff_ddof1'] * 100:.2f}%`** |",
-        f"| **Slice Balanced Accuracy** | `{bs_base['balanced_accuracy'] * 100:.2f}%` | **`{_pct(base['slice_level']['balanced_accuracy'])}`** | `{bs_conv['balanced_accuracy'] * 100:.2f}%` | `{_pct(conv['slice_level']['balanced_accuracy'])}` | `+7.75% ± 2.53%` |",
-        f"| **Slice Macro-F1** | `{bs_base['macro_f1']:.4f}` | **`{_dec(base['slice_level']['macro_f1'])}`** | `{bs_conv['macro_f1']:.4f}` | `{_dec(conv['slice_level']['macro_f1'])}` | `+{pair['macro_f1']['mean_diff_baseline_minus_convnext']:.4f} ± {pair['macro_f1']['std_diff_ddof1']:.4f}` |",
-        f"| **Slice Test AUROC / PR-AUC** | `{bs_base['auroc']:.4f}` / `{bs_base['pr_auc']:.4f}` | **`{_dec(base['slice_level']['auroc'])}`** / **`{_dec(base['slice_level']['pr_auc'])}`** | `{bs_conv['auroc']:.4f}` / `{bs_conv['pr_auc']:.4f}` | `{_dec(conv['slice_level']['auroc'])}` / `{_dec(conv['slice_level']['pr_auc'])}` | **`+{pair['auroc']['mean_diff_baseline_minus_convnext']:.4f} ± {pair['auroc']['std_diff_ddof1']:.4f}`** |",
-        f"| **Scan Mean-Prob Accuracy (20 slices)** | `{bs_base['patient_level']['scan_mean_prob_accuracy'] * 100:.2f}%` `[{b_s42_ci[0] * 100:.2f}%, {b_s42_ci[1] * 100:.2f}%]` | **`{_pct(base['patient_level']['scan_mean_prob_accuracy'])}`** | `{bs_conv['patient_level']['scan_mean_prob_accuracy'] * 100:.2f}%` `[{c_s42_ci[0] * 100:.2f}%, {c_s42_ci[1] * 100:.2f}%]` | `{_pct(conv['patient_level']['scan_mean_prob_accuracy'])}` | **`+{pair['scan_accuracy']['mean_diff_baseline_minus_convnext'] * 100:.2f}% ± {pair['scan_accuracy']['std_diff_ddof1'] * 100:.2f}%`** |",
-        f"| **Scan Majority-Vote Accuracy** | `{bs_base['patient_level']['scan_majority_vote_accuracy'] * 100:.2f}%` (`179/239` scans) | **`{_pct(base['patient_level']['scan_majority_vote_accuracy'])}`** | `{bs_conv['patient_level']['scan_majority_vote_accuracy'] * 100:.2f}%` (`167/239` scans) | `{_pct(conv['patient_level']['scan_majority_vote_accuracy'])}` | `+6.83% ± 2.91%` |",
-        f"| **Scan-Level AUROC** | `{bs_base['patient_level']['patient_auroc']:.4f}` | **`{_dec(base['patient_level']['patient_auroc'])}`** | `{bs_conv['patient_level']['patient_auroc']:.4f}` | `{_dec(conv['patient_level']['patient_auroc'])}` | `+0.0821 ± 0.0149` |",
-        f"| **Subject-Level Accuracy (`102` subjects)** | `{bs_base['patient_level']['subject_accuracy'] * 100:.2f}%` `[{b_sub_ci[0] * 100:.2f}%, {b_sub_ci[1] * 100:.2f}%]` | **`{_pct(base['patient_level']['subject_accuracy'])}`** | `{bs_conv['patient_level']['subject_accuracy'] * 100:.2f}%` `[{c_sub_ci[0] * 100:.2f}%, {c_sub_ci[1] * 100:.2f}%]` | `{_pct(conv['patient_level']['subject_accuracy'])}` | **`+{pair['subject_accuracy']['mean_diff_baseline_minus_convnext'] * 100:.2f}% ± {pair['subject_accuracy']['std_diff_ddof1'] * 100:.2f}%`** |",
-        f"| **Subject-Level AUROC** | `{bs_base['patient_level']['subject_auroc']:.4f}` | **`{_dec(base['patient_level']['subject_auroc'])}`** | `{bs_conv['patient_level']['subject_auroc']:.4f}` | `{_dec(conv['patient_level']['subject_auroc'])}` | `+0.0808 ± 0.0290` |",
-        f"| **Uncalibrated -> Calibrated ECE** | `{bs_base['ece_uncalibrated']:.4f} -> {bs_base['ece_calibrated']:.4f}` (`T*={bs_base['temperature']:.2f}`) | `{base['slice_level']['ece_uncalibrated']['mean']:.4f} -> {_dec(base['slice_level']['ece_calibrated'])}` | **`{bs_conv['ece_uncalibrated']:.4f} -> {bs_conv['ece_calibrated']:.4f}`** (`T*={bs_conv['temperature']:.2f}`) | **`{conv['slice_level']['ece_uncalibrated']['mean']:.4f} -> {_dec(conv['slice_level']['ece_calibrated'])}` (`-87.8%`)** | — |",
+        f"| **Slice Test Accuracy** | `{bs_base['accuracy'] * 100:.2f}%` (`{_slice_count(bs_base)}`) | **`{_pct(base['slice_level']['accuracy'])}`** | `{bs_conv['accuracy'] * 100:.2f}%` (`{_slice_count(bs_conv)}`) | `{_pct(conv['slice_level']['accuracy'])}` | **`{_pdiff_pct('slice_level', 'accuracy')}`** |",
+        f"| **Slice Balanced Accuracy** | `{bs_base['balanced_accuracy'] * 100:.2f}%` | **`{_pct(base['slice_level']['balanced_accuracy'])}`** | `{bs_conv['balanced_accuracy'] * 100:.2f}%` | `{_pct(conv['slice_level']['balanced_accuracy'])}` | `{_pdiff_pct('slice_level', 'balanced_accuracy')}` |",
+        f"| **Slice Macro-F1** | `{bs_base['macro_f1']:.4f}` | **`{_dec(base['slice_level']['macro_f1'])}`** | `{bs_conv['macro_f1']:.4f}` | `{_dec(conv['slice_level']['macro_f1'])}` | `{_pdiff_dec('slice_level', 'macro_f1')}` |",
+        f"| **Slice Test AUROC / PR-AUC** | `{bs_base['auroc']:.4f}` / `{bs_base['pr_auc']:.4f}` | **`{_dec(base['slice_level']['auroc'])}`** / **`{_dec(base['slice_level']['pr_auc'])}`** | `{bs_conv['auroc']:.4f}` / `{bs_conv['pr_auc']:.4f}` | `{_dec(conv['slice_level']['auroc'])}` / `{_dec(conv['slice_level']['pr_auc'])}` | **`{_pdiff_dec('slice_level', 'auroc')}`** |",
+        f"| **Scan Mean-Prob Accuracy (20 slices)** | `{bs_base['patient_level']['scan_mean_prob_accuracy'] * 100:.2f}%` `[{b_s42_ci[0] * 100:.2f}%, {b_s42_ci[1] * 100:.2f}%]` | **`{_pct(base['patient_level']['scan_mean_prob_accuracy'])}`** | `{bs_conv['patient_level']['scan_mean_prob_accuracy'] * 100:.2f}%` `[{c_s42_ci[0] * 100:.2f}%, {c_s42_ci[1] * 100:.2f}%]` | `{_pct(conv['patient_level']['scan_mean_prob_accuracy'])}` | **`{_pdiff_pct('patient_level', 'scan_mean_prob_accuracy')}`** |",
+        f"| **Scan Majority-Vote Accuracy** | `{bs_base['patient_level']['scan_majority_vote_accuracy'] * 100:.2f}%` (`{_scan_count(bs_base)}` scans) | **`{_pct(base['patient_level']['scan_majority_vote_accuracy'])}`** | `{bs_conv['patient_level']['scan_majority_vote_accuracy'] * 100:.2f}%` (`{_scan_count(bs_conv)}` scans) | `{_pct(conv['patient_level']['scan_majority_vote_accuracy'])}` | `{_pdiff_pct('patient_level', 'scan_majority_vote_accuracy')}` |",
+        f"| **Scan-Level AUROC** | `{bs_base['patient_level']['patient_auroc']:.4f}` | **`{_dec(base['patient_level']['patient_auroc'])}`** | `{bs_conv['patient_level']['patient_auroc']:.4f}` | `{_dec(conv['patient_level']['patient_auroc'])}` | `{_pdiff_dec('patient_level', 'patient_auroc')}` |",
+        f"| **Subject-Level Accuracy (`102` subjects)** | `{bs_base['patient_level']['subject_accuracy'] * 100:.2f}%` `[{b_sub_ci[0] * 100:.2f}%, {b_sub_ci[1] * 100:.2f}%]` | **`{_pct(base['patient_level']['subject_accuracy'])}`** | `{bs_conv['patient_level']['subject_accuracy'] * 100:.2f}%` `[{c_sub_ci[0] * 100:.2f}%, {c_sub_ci[1] * 100:.2f}%]` | `{_pct(conv['patient_level']['subject_accuracy'])}` | **`{_pdiff_pct('patient_level', 'subject_accuracy')}`** |",
+        f"| **Subject-Level AUROC** | `{bs_base['patient_level']['subject_auroc']:.4f}` | **`{_dec(base['patient_level']['subject_auroc'])}`** | `{bs_conv['patient_level']['subject_auroc']:.4f}` | `{_dec(conv['patient_level']['subject_auroc'])}` | `{_pdiff_dec('patient_level', 'subject_auroc')}` |",
+        f"| **Uncalibrated -> Calibrated ECE** | `{bs_base['ece_uncalibrated']:.4f} -> {bs_base['ece_calibrated']:.4f}` (`T*={bs_base['temperature']:.2f}`) | `{base['slice_level']['ece_uncalibrated']['mean']:.4f} -> {_dec(base['slice_level']['ece_calibrated'])}` | **`{bs_conv['ece_uncalibrated']:.4f} -> {bs_conv['ece_calibrated']:.4f}`** (`T*={bs_conv['temperature']:.2f}`) | **`{c_ece_raw:.4f} -> {_dec(conv['slice_level']['ece_calibrated'])}` (`{ece_red:+.1f}%`)** | — |",
     ]
     return "\n".join(lines)
 
@@ -149,6 +195,8 @@ def generate_table_3_1d(b3: Dict[str, object], ab: Dict[str, object]) -> str:
     p_pb = agg["paired_convnext_patchify_bn_minus_convnext"]["scan_accuracy"]
     p_bn = agg["paired_convnext_bn_stem_minus_convnext"]["scan_accuracy"]
 
+    base_params = int(ab["aggregated"]["convnext"]["total_params"]) if "convnext" in ab["aggregated"] else 2176866
+
     def _pct(d: Dict[str, float]) -> str:
         return f"`{d['mean'] * 100:.2f}% ± {d['std'] * 100:.2f}%`"
 
@@ -157,13 +205,30 @@ def generate_table_3_1d(b3: Dict[str, object], ab: Dict[str, object]) -> str:
         sc = m_dict["patient_level"]["patient_auroc"]
         return f"`{sl['mean']:.4f} ± {sl['std']:.4f}` / `{sc['mean']:.4f} ± {sc['std']:.4f}`"
 
+    def _paired_cell(p_dict: Dict[str, object], bold: bool) -> str:
+        diffs = p_dict["per_seed_diffs"]
+        mu, sd = _mean_sd(diffs)
+        _, p_val = paired_t_pvalue_df2(diffs)
+        seeds = ", ".join(f"{d * 100:+.2f}" for d in diffs)
+        head = f"`{mu * 100:+.2f} ± {sd * 100:.2f} pp`"
+        p_str = f"`p={p_val:.4f}`"
+        if bold:
+            head, p_str = f"**{head}**", f"**{p_str}**"
+        return f"{head} (`{seeds} pp`, {p_str})"
+
+    def _delta(params: int) -> str:
+        return f"{params - base_params:+,}"
+
+    ref_seeds = ", ".join(f"{v * 100:.2f}%" for v in c_base["patient_level"]["scan_mean_prob_accuracy"]["values"])
+    _, p_bn_val = paired_t_pvalue_df2(p_bn["per_seed_diffs"])
+
     lines = [
-        "| `2×2` Ablation Variant (`modules.py`) | Stem Geometry | Stem & Downsample Norm | Trainable Params (`Delta vs. ConvNeXt`) | 3-Seed Slice Acc (`Mean ± SD`, `ddof=1`) | 3-Seed Scan Acc (`Mean ± SD`, `ddof=1`) | 3-Seed Subject Acc (`Mean ± SD`, `ddof=1`) | 3-Seed Slice AUROC / Scan AUROC | Paired Scan Acc Diff vs. Standard `ConvNeXt` (`Per-Seed Diffs`) |",
+        "| `2×2` Ablation Variant (`modules.py`) | Stem Geometry | Stem & Downsample Norm | Trainable Params (`Delta vs. ConvNeXt`) | 3-Seed Slice Acc (`Mean ± SD`, `ddof=1`) | 3-Seed Scan Acc (`Mean ± SD`, `ddof=1`) | 3-Seed Subject Acc (`Mean ± SD`, `ddof=1`) | 3-Seed Slice AUROC / Scan AUROC | Paired Scan Acc Diff vs. Standard `ConvNeXt` (`Per-Seed Diffs`, Paired *t*-Test `df=2`) |",
         "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
-        f"| **`convnext` (Standard `[Hard]`)** | `4×4` Patchify (`stride=4`) | `LayerNorm2d` | `2,176,866` (`0`) | {_pct(c_base['slice_level']['accuracy'])} | {_pct(c_base['patient_level']['scan_mean_prob_accuracy'])} | {_pct(c_base['patient_level']['subject_accuracy'])} | {_auroc(c_base)} | Baseline reference (`67.36%`, `74.22%`, `69.87%`) |",
-        f"| **`convnext_overlap_ln`** | `3×3` Conv + `2×2` MaxPool | `LayerNorm2d` | `{ol['total_params']:,}` (`+{ol['total_params'] - 2176866:,}`) | {_pct(ol['slice_level']['accuracy'])} | {_pct(ol['patient_level']['scan_mean_prob_accuracy'])} | {_pct(ol['patient_level']['subject_accuracy'])} | {_auroc(ol)} | `{p_ol['mean_diff_vs_convnext'] * 100:+.2f} ± {p_ol['std_diff_ddof1'] * 100:.2f} pp` (`+3.77`, `-1.33`, `-5.24 pp`, `p=0.75`) |",
-        f"| **`convnext_patchify_bn`** | `4×4` Patchify (`stride=4`) | **`BatchNorm2d`** | `{pb['total_params']:,}` (`{pb['total_params'] - 2176866:,}`) | {_pct(pb['slice_level']['accuracy'])} | {_pct(pb['patient_level']['scan_mean_prob_accuracy'])} | **{_pct(pb['patient_level']['subject_accuracy'])}** | {_auroc(pb)} | `{p_pb['mean_diff_vs_convnext'] * 100:+.2f} ± {p_pb['std_diff_ddof1'] * 100:.2f} pp` (`+5.86`, `0.00`, `+3.49 pp`, `p=0.21`) |",
-        f"| **`convnext_bn_stem`** | **`3×3` Conv + `2×2` MaxPool** | **`BatchNorm2d`** | `{bn['total_params']:,}` (`+{bn['total_params'] - 2176866:,}`) | **{_pct(bn['slice_level']['accuracy'])}** | **{_pct(bn['patient_level']['scan_mean_prob_accuracy'])}** | {_pct(bn['patient_level']['subject_accuracy'])} | **{_auroc(bn)}** | **`{p_bn['mean_diff_vs_convnext'] * 100:+.2f} ± {p_bn['std_diff_ddof1'] * 100:.2f} pp`** (`+5.44`, `+4.44`, `+5.24 pp`, **`p=0.0037`**) |",
+        f"| **`convnext` (Standard `[Hard]`)** | `4×4` Patchify (`stride=4`) | `LayerNorm2d` | `{base_params:,}` (`0`) | {_pct(c_base['slice_level']['accuracy'])} | {_pct(c_base['patient_level']['scan_mean_prob_accuracy'])} | {_pct(c_base['patient_level']['subject_accuracy'])} | {_auroc(c_base)} | Reference (per-seed scan acc `{ref_seeds}`) |",
+        f"| **`convnext_overlap_ln`** | `3×3` Conv + `2×2` MaxPool | `LayerNorm2d` | `{ol['total_params']:,}` (`{_delta(ol['total_params'])}`) | {_pct(ol['slice_level']['accuracy'])} | {_pct(ol['patient_level']['scan_mean_prob_accuracy'])} | {_pct(ol['patient_level']['subject_accuracy'])} | {_auroc(ol)} | {_paired_cell(p_ol, False)} |",
+        f"| **`convnext_patchify_bn`** | `4×4` Patchify (`stride=4`) | **`BatchNorm2d`** | `{pb['total_params']:,}` (`{_delta(pb['total_params'])}`) | {_pct(pb['slice_level']['accuracy'])} | {_pct(pb['patient_level']['scan_mean_prob_accuracy'])} | {_pct(pb['patient_level']['subject_accuracy'])} | {_auroc(pb)} | {_paired_cell(p_pb, False)} |",
+        f"| **`convnext_bn_stem`** | **`3×3` Conv + `2×2` MaxPool** | **`BatchNorm2d`** | `{bn['total_params']:,}` (`{_delta(bn['total_params'])}`) | **{_pct(bn['slice_level']['accuracy'])}** | **{_pct(bn['patient_level']['scan_mean_prob_accuracy'])}** | {_pct(bn['patient_level']['subject_accuracy'])} | **{_auroc(bn)}** | {_paired_cell(p_bn, p_bn_val < 0.05)} |",
     ]
     return "\n".join(lines)
 
@@ -222,7 +287,37 @@ def verify_readme_matches_json(
     return (len(mismatches) == 0), mismatches
 
 
+def update_readme_tables(
+    readme_path: Path = README_PATH,
+    results_dir: Path = RESULTS_DIR,
+) -> None:
+    """Populate or update marked table blocks in README.md from results/*.json."""
+    readme_text = readme_path.read_text(encoding="utf-8")
+    audit = _load_json(results_dir / "protocol_audit.json")
+    b3 = _load_json(results_dir / "benchmark_subject_3seeds.json")
+    bs = _load_json(results_dir / "benchmark_subject.json")
+    ab = _load_json(results_dir / "ablation_stem_3seeds.json")
+
+    expected_tables = {
+        "TABLE_3_0A": generate_table_3_0a(audit),
+        "TABLE_3_1A": generate_table_3_1a(b3, bs),
+        "TABLE_3_1C": generate_table_3_1c(bs, ab),
+        "TABLE_3_1D": generate_table_3_1d(b3, ab),
+    }
+
+    for marker, expected_md in expected_tables.items():
+        pattern = rf"<!-- BEGIN:{marker} -->.*?<!-- END:{marker} -->"
+        replacement = f"<!-- BEGIN:{marker} -->\n{expected_md}\n<!-- END:{marker} -->"
+        readme_text = re.sub(pattern, replacement, readme_text, flags=re.DOTALL)
+
+    readme_path.write_text(readme_text, encoding="utf-8")
+    print(f"Updated marker blocks ({', '.join(expected_tables.keys())}) in {readme_path.name}")
+
+
 def main() -> None:
+    if "--update" in sys.argv or "--write" in sys.argv:
+        update_readme_tables()
+
     audit = _load_json(RESULTS_DIR / "protocol_audit.json")
     b3 = _load_json(RESULTS_DIR / "benchmark_subject_3seeds.json")
     bs = _load_json(RESULTS_DIR / "benchmark_subject.json")
@@ -241,7 +336,10 @@ def main() -> None:
     print(f"\nREADME-vs-JSON marker-block & spot-check verification: {'PASSED' if ok else 'FAILED'}")
     for e in errs:
         print("  -", e)
+    if not ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
+
