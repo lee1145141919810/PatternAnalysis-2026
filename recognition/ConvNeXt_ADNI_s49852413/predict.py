@@ -141,17 +141,35 @@ def plot_sample_predictions_grid(
     y_pred = np.argmax(cal_probs, axis=1)
     conf = np.max(cal_probs, axis=1)
 
-    # Pick 3 high-confidence correct NC, 3 high-confidence correct AD, and 2 borderline/routed cases
+    # Pick 3 high-confidence correct NC, 3 high-confidence correct AD, and 2 borderline/routed cases from 8 distinct scans/subjects
     nc_corr = np.where((y_true == 0) & (y_pred == 0) & (conf >= triage_tau))[0]
     ad_corr = np.where((y_true == 1) & (y_pred == 1) & (conf >= triage_tau))[0]
     borderline = np.where(conf < triage_tau)[0]
 
     selected_indices: List[int] = []
-    selected_indices.extend(nc_corr[:3].tolist())
-    selected_indices.extend(ad_corr[:3].tolist())
-    selected_indices.extend(borderline[:2].tolist())
-    while len(selected_indices) < 8:
-        selected_indices.append(len(selected_indices))
+    seen_patients: set[str] = set()
+
+    def _pick_distinct(candidates: np.ndarray, k: int) -> None:
+        for idx_val in candidates.tolist():
+            rec_cand = test_ds.records[int(idx_val)]
+            key = rec_cand.subject_id or rec_cand.patient_id
+            if key not in seen_patients:
+                seen_patients.add(key)
+                selected_indices.append(int(idx_val))
+                if len(selected_indices) >= k:
+                    break
+
+    _pick_distinct(nc_corr, 3)
+    _pick_distinct(ad_corr, 6)
+    _pick_distinct(borderline, 8)
+    for fallback_idx in range(len(test_ds.records)):
+        if len(selected_indices) >= 8:
+            break
+        rec_fb = test_ds.records[fallback_idx]
+        key_fb = rec_fb.subject_id or rec_fb.patient_id
+        if key_fb not in seen_patients:
+            seen_patients.add(key_fb)
+            selected_indices.append(fallback_idx)
     selected_indices = selected_indices[:8]
 
     fig, axes = plt.subplots(2, 4, figsize=(16, 8.2), dpi=180)
