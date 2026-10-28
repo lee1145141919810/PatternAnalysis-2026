@@ -1,4 +1,4 @@
-# git_commit=eb90647
+# git_commit=b3e6b77
 === TABLE_3_0A ===
 | Official Folder Partition | Total Slices | 3D Scans (`Ixxxxxx`) | Unique Subjects (`XXX_S_XXXX`) | Scan ID Range (`min – max (median)`) | Acquisition Year (`min – max (median)`) | Era Breakdown (`< 2017` ADNI-2 vs. `>= 2017` ADNI-3) | Pulse Sequence Naming Breakdown (`protocol_counts`) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
@@ -84,4 +84,4 @@ recognition/ConvNeXt_ADNI_s49852413/test_pipeline.py::test_selective_triage_rout
     ParserElement.enablePackrat()
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-======================== 9 passed, 14 warnings in 3.12s ========================
+======================== 9 passed, 14 warnings in 3.62s ========================
