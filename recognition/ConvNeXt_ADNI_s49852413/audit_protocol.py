@@ -25,13 +25,19 @@ import numpy as np
 
 from dataset import (
     _load_raw_grayscale,
+    _split_subject_disjoint,
     resolve_adni_root,
     scan_split_directory,
 )
 
 
 def classify_protocol(raw_path_str: str) -> str:
-    """Categorize ADNI NIfTI filename into acquisition sequence family."""
+    """Categorize ADNI NIfTI filename by MRI pulse sequence naming convention.
+
+    Note: Sequence naming (`Standard_Sagittal_MPRAGE`, `Accelerated_Sagittal_MPRAGE`,
+    `Accelerated_Sag_IR-FSPGR`) reflects scanner pulse sequence parameters, whereas
+    acquisition era (`< 2017` ADNI-2 vs `>= 2017` ADNI-3) is determined from `extract_year`.
+    """
     if not raw_path_str:
         return "Unmapped"
     if "IR-FSPGR" in raw_path_str or "IR_FSPGR" in raw_path_str:
@@ -89,6 +95,7 @@ def run_protocol_audit(data_root: str | Path | None = None) -> Dict[str, object]
                 }
 
         by_class_proto: Dict[str, Counter] = defaultdict(Counter)
+        by_class_era: Dict[str, Counter] = defaultdict(Counter)
         by_class_years: Dict[str, List[int]] = defaultdict(list)
         by_class_scan_ids: Dict[str, List[int]] = defaultdict(list)
         subjects_by_class: Dict[str, set] = defaultdict(set)
@@ -98,6 +105,8 @@ def run_protocol_audit(data_root: str | Path | None = None) -> Dict[str, object]
             by_class_proto[cls][info["protocol"]] += 1
             if info["year"] is not None:
                 by_class_years[cls].append(info["year"])
+                era_key = "pre_2017_ADNI2" if info["year"] < 2017 else "post_2017_ADNI3"
+                by_class_era[cls][era_key] += 1
             if info["scan_id"].isdigit():
                 by_class_scan_ids[cls].append(int(info["scan_id"]))
             subjects_by_class[cls].add(info["subject_id"])
@@ -122,6 +131,7 @@ def run_protocol_audit(data_root: str | Path | None = None) -> Dict[str, object]
                 "year_min": int(yrs[0]) if yrs else None,
                 "year_median": int(yrs[len(yrs) // 2]) if yrs else None,
                 "year_max": int(yrs[-1]) if yrs else None,
+                "era_counts": dict(sorted(by_class_era[cls].items())),
                 "protocol_counts": dict(sorted(by_class_proto[cls].items())),
             }
         return summary, subjects_by_class, scans
@@ -135,16 +145,26 @@ def run_protocol_audit(data_root: str | Path | None = None) -> Dict[str, object]
     all_test_subjs = test_subjs["AD"] | test_subjs["NC"]
     total_overlap = all_train_subjs & all_test_subjs
 
-    # Compute pixel mean/std strictly on a stratified sample of official_train slices (never touching test)
+    # Compute pixel mean/std on (a) official_train and (b) subject-disjoint train split (seed=42)
     rng = np.random.default_rng(42)
     sample_indices = rng.choice(len(train_records), size=min(1000, len(train_records)), replace=False)
-    pix_vals = []
-    for idx in sample_indices:
-        arr = _load_raw_grayscale(train_records[int(idx)].filepath) / 255.0
-        pix_vals.append(arr)
+    pix_vals = [_load_raw_grayscale(train_records[int(idx)].filepath) / 255.0 for idx in sample_indices]
     stacked = np.stack(pix_vals, axis=0)
     train_cohort_mean = float(np.mean(stacked))
     train_cohort_std = float(np.std(stacked))
+
+    subj_tr_records, _, _ = _split_subject_disjoint(
+        scan_split_directory(resolved_root / "train") + scan_split_directory(resolved_root / "test"),
+        meta_path,
+        seed=42,
+        val_fraction=0.15,
+        train_slice_stride=2,
+    )
+    rng_subj = np.random.default_rng(42)
+    subj_sample_idx = rng_subj.choice(len(subj_tr_records), size=min(1000, len(subj_tr_records)), replace=False)
+    subj_pix = np.stack([_load_raw_grayscale(subj_tr_records[int(idx)].filepath) / 255.0 for idx in subj_sample_idx], axis=0)
+    subj_tr_mean = float(np.mean(subj_pix))
+    subj_tr_std = float(np.std(subj_pix))
 
     report = {
         "dataset_total_slices": len(train_records) + len(test_records),
@@ -160,9 +180,15 @@ def run_protocol_audit(data_root: str | Path | None = None) -> Dict[str, object]
         },
         "train_only_intensity_statistics": {
             "cropped_roi": "[16:208, 48:224]",
-            "computed_on": "1000 random slices from official_train only (test strictly excluded)",
-            "mean": round(train_cohort_mean, 4),
-            "std": round(train_cohort_std, 4),
+            "fixed_pipeline_shift_scale": [0.18, 0.25],
+            "official_train_1000_slice_sample": {
+                "mean": round(train_cohort_mean, 4),
+                "std": round(train_cohort_std, 4),
+            },
+            "subject_disjoint_train_1000_slice_sample_seed42": {
+                "mean": round(subj_tr_mean, 4),
+                "std": round(subj_tr_std, 4),
+            },
         },
     }
 

@@ -60,10 +60,10 @@ def test_modules_has_zero_numpy_dependency() -> None:
 
 def test_convnext_and_baseline_forward_backward() -> None:
     """Verify forward logits, feature maps, Grad-CAM shapes, and backward gradients."""
-    x = torch.randn(4, 1, 128, 128)
+    x = torch.randn(4, 1, 96, 96)
     y = torch.tensor([0, 1, 0, 1], dtype=torch.long)
 
-    for name in ("baseline", "convnext"):
+    for name in ("baseline", "convnext", "convnext_bn_stem"):
         model = build_model(name, in_channels=1, num_classes=2)
         logits = model(x)
         assert logits.shape == (4, 2)
@@ -75,7 +75,7 @@ def test_convnext_and_baseline_forward_backward() -> None:
         assert len(grad_norms) > 0 and all(np.isfinite(g) for g in grad_norms)
 
         cam = compute_spatial_attribution(model, x)
-        assert cam.shape == (4, 128, 128)
+        assert cam.shape == (4, 96, 96)
         assert float(cam.min()) >= -1e-5 and float(cam.max()) <= 1.0 + 1e-5
 
 
@@ -157,7 +157,7 @@ def test_subject_disjoint_split_has_zero_subject_leakage(tmp_path: Path) -> None
         c_name = "AD" if lab == 1 else "NC"
         for scan_k in range(4):
             scan_id = f"{s_idx*10 + scan_k + 100:06d}"
-            meta_payload[scan_id] = {"raw": f"ADNI_{subj_str}_MR_{scan_id}"}
+            meta_payload[scan_id] = {"raw": f"ADNI_{subj_str}_MR__br_raw_20180101_{scan_id}"}
             for sl in range(2):
                 records.append(
                     SliceRecord(
@@ -171,6 +171,7 @@ def test_subject_disjoint_split_has_zero_subject_leakage(tmp_path: Path) -> None
 
     meta_file.write_text(json.dumps(meta_payload), encoding="utf-8")
     scan2subj = _scan_to_subject_map(records, meta_file, strict=True)
+    assert all(r.acquisition_year == 2018 for r in records)
     tr, va, te = _split_subject_disjoint(records, meta_file, seed=42, val_fraction=0.2, test_fraction=0.2)
 
     audit_subj = verify_no_patient_leakage(tr, va, te, require_subject_disjoint=True)
@@ -218,4 +219,39 @@ def test_selective_triage_routing_monotonicity() -> None:
     for i in range(len(coverages) - 1):
         assert coverages[i] >= coverages[i + 1]
         assert referrals[i] <= referrals[i + 1]
+
+
+def test_era_slice_position_and_ddof1_aggregation() -> None:
+    """Verify era stratification, 5-quintile slice-position telemetry, and ddof=1 multiseed std."""
+    from train import _aggregate_multiseed_metrics, compute_comprehensive_metrics
+
+    logits = torch.tensor([[2.0, -1.0], [-1.5, 2.5], [1.2, -0.8], [-2.0, 1.8]] * 5, dtype=torch.float32)
+    labels = torch.tensor([0, 1, 0, 1] * 5, dtype=torch.long)
+    metas = [
+        {
+            "patient_id": f"p_{i // 5}",
+            "subject_id": f"s_{i // 10}",
+            "slice_index": i % 5,
+            "acquisition_year": 2013 if i < 10 else 2019,
+        }
+        for i in range(20)
+    ]
+    m = compute_comprehensive_metrics(logits, labels, temperature=1.0, metas=metas)
+    assert "pre_2017_adni2" in m["era_stratified"]
+    assert "post_2017_adni3" in m["era_stratified"]
+    assert len(m["slice_position_quintiles"]) == 5
+    assert m["patient_level"]["scan_acc_ci95_method"] == "subject_cluster_bootstrap_1000"
+
+    # Check ddof=1 vs ddof=0 in _aggregate_multiseed_metrics
+    m2 = dict(m)
+    m2["accuracy"] = 0.50
+    runs = [
+        {"seed": 42, "models": {"baseline": {"test_metrics": m}, "convnext": {"test_metrics": m2}}},
+        {"seed": 43, "models": {"baseline": {"test_metrics": m2}, "convnext": {"test_metrics": m}}},
+    ]
+    agg = _aggregate_multiseed_metrics(runs)
+    assert agg["baseline"]["slice_level"]["accuracy"]["ddof"] == 1
+    assert abs(agg["baseline"]["slice_level"]["accuracy"]["std"] - float(np.std([1.0, 0.5], ddof=1))) < 1e-4
+    assert "paired_baseline_minus_convnext" in agg
+
 

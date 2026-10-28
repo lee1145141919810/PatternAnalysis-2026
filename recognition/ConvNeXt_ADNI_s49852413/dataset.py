@@ -55,6 +55,7 @@ class SliceRecord:
     patient_id: str
     slice_index: int
     subject_id: Optional[str] = None
+    acquisition_year: Optional[int] = None
 
 
 def resolve_adni_root(data_root: Optional[str | Path] = None) -> Path:
@@ -390,9 +391,10 @@ class ADNIDataset(Dataset):
         """Standardize slice intensities.
 
         When `use_cohort_stats=True` (used for the skull-stripped ADNI slices derived from
-        `ADNI_T1_3T_MASKED_N4`), normalizes by fixed training-split ROI constants (`0.18`, `0.25`;
-        empirical train-only ROI mean=0.2087, std=0.2682 in `results/protocol_audit.json`, test
-        strictly excluded) so whole-brain tissue-to-ICV volume ratios are preserved.
+        `ADNI_T1_3T_MASKED_N4`), applies a fixed global affine shift/scale `(img - 0.18) / 0.25`
+        (chosen as round constants near the empirical training-split ROI mean≈0.20–0.21, std≈0.26–0.27
+        reported in `results/protocol_audit.json`, without fitting to validation or test splits)
+        so whole-brain tissue-to-ICV volume ratios are preserved across slices.
         When `use_cohort_stats=False` (default for standalone calls), applies per-slice
         zero-mean unit-variance Z-score standardization.
         """
@@ -430,6 +432,7 @@ class ADNIDataset(Dataset):
                 "subject_id": rec.subject_id or rec.patient_id,
                 "slice_index": rec.slice_index,
                 "class_name": rec.class_name,
+                "acquisition_year": int(rec.acquisition_year) if rec.acquisition_year is not None else 0,
             }
             return tensor_img, label, meta
         return tensor_img, label
@@ -440,7 +443,7 @@ def _scan_to_subject_map(
     meta_json_path: Path,
     strict: bool = True,
 ) -> Dict[str, str]:
-    """Map each 3D scan id (`patient_id`) to its ADNI subject id (`XXX_S_XXXX`) and populate `r.subject_id`.
+    """Map each 3D scan id (`patient_id`) to its ADNI subject id (`XXX_S_XXXX`) and populate `r.subject_id` and `r.acquisition_year`.
 
     Raises:
         RuntimeError: If `strict=True` and any scan ID cannot be resolved to an ADNI subject ID.
@@ -450,6 +453,7 @@ def _scan_to_subject_map(
     with open(meta_json_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
     mapping: Dict[str, str] = {}
+    year_mapping: Dict[str, Optional[int]] = {}
     unmapped_scans: List[str] = []
     for r in all_records:
         if r.patient_id not in mapping:
@@ -461,7 +465,10 @@ def _scan_to_subject_map(
             else:
                 unmapped_scans.append(r.patient_id)
                 mapping[r.patient_id] = r.patient_id
+            m_yr = re.search(r"_br_raw_(\d{4})\d{4}", raw_str)
+            year_mapping[r.patient_id] = int(m_yr.group(1)) if m_yr else None
         object.__setattr__(r, "subject_id", mapping[r.patient_id])
+        object.__setattr__(r, "acquisition_year", year_mapping[r.patient_id])
 
     if strict and len(unmapped_scans) > 0:
         raise RuntimeError(

@@ -210,8 +210,11 @@ def conduct_failure_case_autopsy(
     device: torch.device,
     out_path: Path,
     triage_tau: float = 0.75,
+    scan_triage_tau: Optional[float] = None,
 ) -> List[Dict[str, object]]:
     """Select 4 failure cases (1 intercepted FN, 1 high-conf escaped FN, 1 intercepted FP, 1 high-conf escaped FP) and generate quantitative autopsy."""
+    if scan_triage_tau is None:
+        scan_triage_tau = triage_tau
     y_true = np.array([r.label for r in test_ds.records])
     raw_probs = F.softmax(raw_logits, dim=-1).numpy()
     cal_probs = F.softmax(raw_logits / temperature, dim=-1).numpy()
@@ -306,22 +309,26 @@ def conduct_failure_case_autopsy(
         s_indices = scan_slice_indices[rec.patient_id]
         s_min, s_max = min(s_indices), max(s_indices)
         rel_slice_pos = float((rec.slice_index - s_min) / max(1, s_max - s_min))
+        quintile_idx = min(5, int(rel_slice_pos * 5.0) + 1)
         scan_mean_p_ad = float(np.mean(scan_ad_probs[rec.patient_id]))
+        scan_conf = float(max(scan_mean_p_ad, 1.0 - scan_mean_p_ad))
         scan_pred_label = 1 if scan_mean_p_ad >= 0.5 else 0
         rescued_by_scan_vote = bool(scan_pred_label == rec.label)
+        intercepted_by_scan_gate = bool(scan_conf < scan_triage_tau)
 
-        plane_zone = (
-            "lateral parasagittal boundary"
-            if (rel_slice_pos <= 0.20 or rel_slice_pos >= 0.80)
-            else "mid-sagittal / medial temporal plane"
-        )
         rescue_note = (
-            f"20-slice scan mean p(AD)={scan_mean_p_ad:.2f} RESCUES this slice error at scan level."
+            f"20-slice scan mean p(AD)={scan_mean_p_ad:.2f} (scan_conf={scan_conf:.2f}) RESCUES this slice error at scan level."
             if rescued_by_scan_vote
-            else f"20-slice scan mean p(AD)={scan_mean_p_ad:.2f} also misclassifies the full scan."
+            else (
+                f"20-slice scan mean p(AD)={scan_mean_p_ad:.2f} (scan_conf={scan_conf:.2f} < τ*_scan={scan_triage_tau:.2f}) "
+                f"misclassifies the scan but is INTERCEPTED by the scan-level triage gate."
+                if intercepted_by_scan_gate
+                else f"20-slice scan mean p(AD)={scan_mean_p_ad:.2f} (scan_conf={scan_conf:.2f} >= τ*_scan={scan_triage_tau:.2f}) "
+                f"also misclassifies the full scan and ESCAPES scan-level triage."
+            )
         )
         trigger = (
-            f"Slice {rec.slice_index} in [{s_min}..{s_max}] (rel_pos={rel_slice_pos:.2f}, {plane_zone}); "
+            f"Slice {rec.slice_index} in [{s_min}..{s_max}] (rel_pos={rel_slice_pos:.2f}, Quintile Q{quintile_idx}); "
             f"foreground={brain_area_frac:.2f}, central dark-CSF ratio={ventricle_dark_frac:.2f}, "
             f"Stage-3 (6×6) Grad-CAM peak=({int(peak_r)},{int(peak_c)}). {rescue_note}"
         )
@@ -410,6 +417,7 @@ def conduct_failure_case_autopsy(
                 "slice_index": int(rec.slice_index),
                 "scan_slice_range": [int(s_min), int(s_max)],
                 "relative_slice_position": round(rel_slice_pos, 4),
+                "slice_position_quintile": f"Q{quintile_idx}",
                 "ground_truth": rec.class_name,
                 "predicted_class": IDX_TO_LABEL[int(y_pred[ds_idx])],
                 "raw_confidence": round(c_raw, 4),
@@ -422,8 +430,10 @@ def conduct_failure_case_autopsy(
                 "central_csf_dark_fraction": round(ventricle_dark_frac, 4),
                 "gradcam_stage2_peak_rc": [int(peak_r), int(peak_c)],
                 "scan_20slice_mean_prob_ad": round(scan_mean_p_ad, 4),
+                "scan_20slice_confidence": round(scan_conf, 4),
                 "rescued_by_20slice_scan_vote": rescued_by_scan_vote,
                 "intercepted_by_triage_gate": bool(routed_to_human),
+                "intercepted_by_scan_triage_gate": intercepted_by_scan_gate,
                 "anatomical_diagnosis": trigger,
             }
         )
@@ -601,6 +611,11 @@ def main() -> None:
         if args.triage_threshold is not None
         else float(ckpt_payload.get("val_selected_tau", 0.75))
     )
+    scan_triage_tau = (
+        float(args.triage_threshold)
+        if args.triage_threshold is not None
+        else float(ckpt_payload.get("val_selected_scan_tau", triage_tau))
+    )
 
     _, _, test_loader, audit = build_adni_dataloaders(
         data_root=args.data_root,
@@ -619,6 +634,7 @@ def main() -> None:
         metas=test_metas,
         use_calibrated_for_triage=use_cal_for_triage,
         selected_tau=triage_tau,
+        selected_scan_tau=scan_triage_tau,
     )
 
     baseline_probs: Optional[np.ndarray] = None
@@ -652,7 +668,7 @@ def main() -> None:
         key=lambda e: abs(e["threshold"] - triage_tau),
     )
     print("\n--- Validation-Selected Clinical Triage Operating Policy ---")
-    print(f"Confidence Gate τ*  : {tau_entry['threshold']:.2f} (selected strictly on validation split)")
+    print(f"Confidence Gate τ*  : {tau_entry['threshold']:.2f} (selected strictly on validation split; scan τ*_scan={scan_triage_tau:.2f})")
     print(f"Automated Coverage  : {tau_entry['coverage'] * 100:.1f}% of incoming slices auto-cleared")
     print(f"Specialist Referral : {tau_entry['referral_rate'] * 100:.1f}% routed to human neuroradiologist")
     print(f"Auto-Cleared Acc    : {tau_entry['accepted_accuracy'] * 100:.2f}%")
@@ -683,6 +699,7 @@ def main() -> None:
         device=device,
         out_path=IMAGES_DIR / "failure_autopsy.png",
         triage_tau=triage_tau,
+        scan_triage_tau=scan_triage_tau,
     )
 
     CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)

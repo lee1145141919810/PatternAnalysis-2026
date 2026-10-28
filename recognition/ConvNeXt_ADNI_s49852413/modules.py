@@ -26,7 +26,7 @@ Implemented Components:
     3. `ConvNeXtBlock`: Modernized ConvNet block with 7x7 depthwise convolution, inverted
        4x bottleneck, GELU activation, and learnable LayerScale (Liu et al., CVPR 2022).
     4. `ConvNeXt`: 4-stage hierarchical ConvNeXt backbone (`[Hard Difficulty]`).
-    5. `SimpleCNNBaseline`: 4-stage 3x3 Conv + BatchNorm2d + ReLU + MaxPool2d baseline.
+    5. `SimpleCNNBaseline`: 3-stage 3x3 Conv + BatchNorm2d + ReLU + MaxPool2d baseline (7,066 parameters).
     6. `TemperatureScaledClassifier`: Post-hoc temperature scaling wrapper (`T > 0`) and
        predictive uncertainty / Shannon entropy quantifier for clinical triage routing.
 """
@@ -144,6 +144,7 @@ class ConvNeXt(nn.Module):
         layer_scale_init_value: float = 0.1,
         head_dropout: float = 0.2,
         stem_stride: int = 4,
+        use_overlapping_bn_stem: bool = False,
     ) -> None:
         super().__init__()
         if len(depths) != 4 or len(dims) != 4:
@@ -152,27 +153,44 @@ class ConvNeXt(nn.Module):
         self.depths = tuple(depths)
         self.dims = tuple(dims)
         self.drop_path_rate = float(drop_path_rate)
+        self.use_overlapping_bn_stem = bool(use_overlapping_bn_stem)
 
-        # Downsampling layers: 4x4 non-overlapping patchify stem + 3 inter-stage transition layers
+        # Downsampling layers: standard 4x4 non-overlapping patchify stem + LayerNorm2d transitions,
+        # or optional overlapping 3x3 Conv + BatchNorm2d stem/transitions for small-cohort ablation
         self.downsample_layers = nn.ModuleList()
-        stem = nn.Sequential(
-            nn.Conv2d(
-                in_channels,
-                dims[0],
-                kernel_size=4,
-                stride=stem_stride,
-                padding=1 if stem_stride == 2 else 0,
-            ),
-            LayerNorm2d(dims[0], eps=1e-6),
-        )
-        self.downsample_layers.append(stem)
-
-        for i in range(3):
-            downsample_layer = nn.Sequential(
-                LayerNorm2d(dims[i], eps=1e-6),
-                nn.Conv2d(dims[i], dims[i + 1], kernel_size=2, stride=2),
+        if self.use_overlapping_bn_stem:
+            stem = nn.Sequential(
+                nn.Conv2d(in_channels, dims[0], kernel_size=3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(dims[0]),
+                nn.GELU(),
+                nn.Conv2d(dims[0], dims[0], kernel_size=3, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(dims[0]),
             )
-            self.downsample_layers.append(downsample_layer)
+            self.downsample_layers.append(stem)
+            for i in range(3):
+                downsample_layer = nn.Sequential(
+                    nn.BatchNorm2d(dims[i]),
+                    nn.Conv2d(dims[i], dims[i + 1], kernel_size=2, stride=2, bias=False),
+                )
+                self.downsample_layers.append(downsample_layer)
+        else:
+            stem = nn.Sequential(
+                nn.Conv2d(
+                    in_channels,
+                    dims[0],
+                    kernel_size=4,
+                    stride=stem_stride,
+                    padding=1 if stem_stride == 2 else 0,
+                ),
+                LayerNorm2d(dims[0], eps=1e-6),
+            )
+            self.downsample_layers.append(stem)
+            for i in range(3):
+                downsample_layer = nn.Sequential(
+                    LayerNorm2d(dims[i], eps=1e-6),
+                    nn.Conv2d(dims[i], dims[i + 1], kernel_size=2, stride=2),
+                )
+                self.downsample_layers.append(downsample_layer)
 
         # Stochastic depth decay schedule across all blocks
         total_blocks = sum(depths)
@@ -226,12 +244,15 @@ class ConvNeXt(nn.Module):
 
 
 class SimpleCNNBaseline(nn.Module):
-    """3-Stage Standard Convolutional Neural Network Baseline with BatchNorm2d for ADNI Screening.
+    """3-Stage Standard Convolutional Neural Network Baseline with BatchNorm2d (7,066 Parameters).
 
-    Upgrades the original 3-stage baseline (`8 -> 16 -> 32`, `3x3` Conv + `ReLU` + `2x2` `MaxPool2d`
-    followed by `AdaptiveAvgPool2d((1, 1))`, 6,018 parameters) with `BatchNorm2d` after every
-    convolution and identical `AdamW` weight decay (`1e-2`), isolating the architectural effect
-    of ConvNeXt's 7x7 depthwise convolutions, inverted bottlenecks, and `LayerNorm2d`.
+    Architecture (`base_channels=8`):
+        - 3 stages of `3x3` Conv (`8 -> 16 -> 32`, `bias=False`) + `BatchNorm2d` + `ReLU` + `2x2` `MaxPool2d`
+          (`96x96 -> 48x48 -> 24x24 -> 12x12`), followed by `AdaptiveAvgPool2d((1, 1))` and a
+          2-layer linear classifier (`32 -> 32 -> 2` with `Dropout(0.25)`).
+        - Uses `BatchNorm2d` after every convolution and identical `AdamW` weight decay (`1e-2`)
+          to provide a well-regularized, non-handicapped convolutional reference against `ConvNeXt`
+          (upgraded in Commit `9d4afeb` from the initial 4-stage unnormalized 5,922-parameter baseline).
     """
 
     def __init__(
@@ -273,7 +294,7 @@ class SimpleCNNBaseline(nn.Module):
         )
 
     def get_last_feature_map(self, x: torch.Tensor) -> torch.Tensor:
-        """Return final spatial feature map `[B, C, 6, 6]` for spatial attribution."""
+        """Return final spatial feature map `[B, C, 12, 12]` (for `96x96` input) for spatial attribution."""
         return self.features(x)
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
@@ -442,6 +463,17 @@ def build_model(
             layer_scale_init_value=0.1,
             stem_stride=4,
         )
+    if name == "convnext_bn_stem":
+        return ConvNeXt(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            depths=(2, 2, 6, 2),
+            dims=(32, 64, 128, 256),
+            drop_path_rate=drop_path_rate,
+            layer_scale_init_value=0.1,
+            stem_stride=4,
+            use_overlapping_bn_stem=True,
+        )
     if name == "convnext_tiny":
         return ConvNeXt(
             in_channels=in_channels,
@@ -453,7 +485,9 @@ def build_model(
         )
     if name in ("baseline", "simple_cnn", "cnn"):
         return SimpleCNNBaseline(in_channels=in_channels, num_classes=num_classes)
-    raise ValueError(f"Unknown model_name '{model_name}'. Choose from: convnext, convnext_tiny, baseline.")
+    raise ValueError(
+        f"Unknown model_name '{model_name}'. Choose from: convnext, convnext_bn_stem, convnext_tiny, baseline."
+    )
 
 
 def count_parameters(model: nn.Module) -> Tuple[int, int]:

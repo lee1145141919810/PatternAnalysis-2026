@@ -220,9 +220,10 @@ def select_validation_triage_threshold(
     """Select the operating confidence threshold tau* strictly on the validation set.
 
     Chooses the lowest threshold tau > 0.50 that intercepts at least `min_fn_interception` (60%)
-    of validation False Negatives while maintaining at least `min_coverage` automated coverage.
-    If no threshold satisfies both constraints simultaneously, picks the threshold maximizing
-    `accepted_accuracy * sqrt(coverage) + 0.5 * intercepted_fn_fraction`.
+    of validation False Negatives while maintaining at least `min_coverage` automated coverage
+    (maximizing coverage among feasible thresholds, with accepted_accuracy as tie-breaker).
+    If no threshold satisfies both constraints simultaneously, picks the threshold in `{tau > 0.50,
+    coverage >= 0.15}` maximizing `accepted_accuracy * sqrt(coverage) + 0.5 * intercepted_fn_fraction`.
     """
     candidates = [
         entry
@@ -232,8 +233,7 @@ def select_validation_triage_threshold(
         and entry["coverage"] >= min_coverage
     ]
     if candidates:
-        # Pick the candidate with highest coverage (lowest tau meeting safety target)
-        best = max(candidates, key=lambda e: (e["coverage"], e["accepted_accuracy"]))
+        best = min(candidates, key=lambda e: (e["threshold"], -e["accepted_accuracy"]))
         return float(best["threshold"])
 
     non_trivial = [e for e in val_triage_sweep if e["threshold"] > 0.50 and e["coverage"] >= 0.15]
@@ -282,8 +282,9 @@ def compute_comprehensive_metrics(
     metas: Optional[List[Dict[str, object]]] = None,
     use_calibrated_for_triage: bool = True,
     selected_tau: Optional[float] = None,
+    selected_scan_tau: Optional[float] = None,
 ) -> Dict[str, object]:
-    """Compute slice-level, scan-level, subject-level, calibration, and selective triage metrics."""
+    """Compute slice-level, scan-level, subject-level, era-stratified, slice-position, calibration, and triage metrics."""
     y_true = labels.numpy().astype(np.int64)
     raw_probs = F.softmax(raw_logits, dim=-1).numpy()
     cal_probs = F.softmax(raw_logits / temperature, dim=-1).numpy()
@@ -320,30 +321,46 @@ def compute_comprehensive_metrics(
         + active_probs[:, 1] * np.log(np.clip(active_probs[:, 1], eps, 1.0))
     ) / math.log(2.0)
 
-    # Scan-level (20 slices per 3D scan) and human Subject-level aggregation
+    # Scan-level (20 slices per 3D scan), Subject-level, Era-stratified, and Slice-Position aggregation
     patient_metrics: Dict[str, object] = {}
     scan_triage_sweep: List[Dict[str, float]] = []
+    era_stratified: Dict[str, object] = {}
+    slice_position_quintiles: List[Dict[str, object]] = []
     if metas:
         pid_probs: Dict[str, List[float]] = defaultdict(list)
         pid_votes: Dict[str, List[int]] = defaultdict(list)
         pid_labels: Dict[str, int] = {}
+        pid_to_sid: Dict[str, str] = {}
+        pid_to_year: Dict[str, int] = {}
+        pid_slice_indices: Dict[str, List[int]] = defaultdict(list)
         subj_probs: Dict[str, List[float]] = defaultdict(list)
         subj_labels: Dict[str, int] = {}
+        subj_to_pids: Dict[str, List[str]] = defaultdict(list)
 
         for i, m in enumerate(metas):
             pid = str(m["patient_id"])
             sid = str(m.get("subject_id", pid))
+            s_idx = int(m.get("slice_index", 0))
+            yr = int(m.get("acquisition_year", 0) or 0)
             pid_probs[pid].append(float(y_score_ad[i]))
             pid_votes[pid].append(int(y_pred[i]))
             pid_labels[pid] = int(y_true[i])
+            pid_to_sid[pid] = sid
+            if yr > 0:
+                pid_to_year[pid] = yr
+            pid_slice_indices[pid].append(s_idx)
             subj_probs[sid].append(float(y_score_ad[i]))
             subj_labels[sid] = int(y_true[i])
 
         sorted_pids = sorted(pid_probs.keys())
+        for pid in sorted_pids:
+            subj_to_pids[pid_to_sid[pid]].append(pid)
+
         p_true = np.array([pid_labels[p] for p in sorted_pids], dtype=np.int64)
         p_score = np.array([np.mean(pid_probs[p]) for p in sorted_pids], dtype=np.float64)
         p_pred_prob = (p_score >= 0.5).astype(np.int64)
         p_pred_vote = np.array([1 if np.mean(pid_votes[p]) >= 0.5 else 0 for p in sorted_pids], dtype=np.int64)
+        pid_correct_map = {p: float(int((np.mean(pid_probs[p]) >= 0.5)) == pid_labels[p]) for p in sorted_pids}
 
         scan_prob_matrix = np.stack([1.0 - p_score, p_score], axis=1)
         scan_triage_sweep = evaluate_selective_triage(scan_prob_matrix, p_true)
@@ -353,9 +370,17 @@ def compute_comprehensive_metrics(
         s_score = np.array([np.mean(subj_probs[s]) for s in sorted_sids], dtype=np.float64)
         s_pred = (s_score >= 0.5).astype(np.int64)
 
+        # Subject-level cluster bootstrap for scan accuracy (resampling subject clusters with replacement)
         rng_boot = np.random.default_rng(42)
+        cluster_scan_boots: List[float] = []
+        n_subj = len(sorted_sids)
+        for _ in range(1000):
+            sampled_sids = rng_boot.choice(sorted_sids, size=n_subj, replace=True)
+            sampled_scan_accs = [pid_correct_map[p] for s in sampled_sids for p in subj_to_pids[str(s)]]
+            cluster_scan_boots.append(float(np.mean(sampled_scan_accs)))
+
         p_correct = (p_true == p_pred_prob).astype(np.float64)
-        p_boots = [float(np.mean(rng_boot.choice(p_correct, size=len(p_correct), replace=True))) for _ in range(1000)]
+        iid_scan_boots = [float(np.mean(rng_boot.choice(p_correct, size=len(p_correct), replace=True))) for _ in range(1000)]
         s_correct = (s_true == s_pred).astype(np.float64)
         s_boots = [float(np.mean(rng_boot.choice(s_correct, size=len(s_correct), replace=True))) for _ in range(1000)]
 
@@ -363,7 +388,15 @@ def compute_comprehensive_metrics(
             "patient_accuracy": float(accuracy_score(p_true, p_pred_prob)),
             "scan_mean_prob_accuracy": float(accuracy_score(p_true, p_pred_prob)),
             "scan_majority_vote_accuracy": float(accuracy_score(p_true, p_pred_vote)),
-            "scan_acc_ci95": [round(float(np.percentile(p_boots, 2.5)), 4), round(float(np.percentile(p_boots, 97.5)), 4)],
+            "scan_acc_ci95": [
+                round(float(np.percentile(cluster_scan_boots, 2.5)), 4),
+                round(float(np.percentile(cluster_scan_boots, 97.5)), 4),
+            ],
+            "scan_acc_ci95_method": "subject_cluster_bootstrap_1000",
+            "scan_acc_iid_ci95": [
+                round(float(np.percentile(iid_scan_boots, 2.5)), 4),
+                round(float(np.percentile(iid_scan_boots, 97.5)), 4),
+            ],
             "patient_macro_f1": float(f1_score(p_true, p_pred_prob, average="macro", zero_division=0)),
             "patient_auroc": float(roc_auc_score(p_true, p_score)),
             "num_patients": int(len(p_true)),
@@ -373,6 +406,73 @@ def compute_comprehensive_metrics(
             "subject_auroc": float(roc_auc_score(s_true, s_score)) if len(np.unique(s_true)) > 1 else 0.0,
             "num_subjects": int(len(s_true)),
         }
+
+        # Era-stratified evaluation (< 2017 ADNI-2 era vs. >= 2017 ADNI-3 era)
+        years_arr = np.array([int(m.get("acquisition_year", 0) or 0) for m in metas], dtype=np.int64)
+        if np.any(years_arr > 0):
+            for era_name, mask in [
+                ("pre_2017_adni2", (years_arr > 0) & (years_arr < 2017)),
+                ("post_2017_adni3", years_arr >= 2017),
+            ]:
+                if not np.any(mask):
+                    continue
+                ey_true = y_true[mask]
+                ey_pred = y_pred[mask]
+                ey_score = y_score_ad[mask]
+                ad_m = ey_true == 1
+                nc_m = ey_true == 0
+                ad_rec = float(np.mean(ey_pred[ad_m] == 1)) if np.any(ad_m) else 0.0
+                nc_rec = float(np.mean(ey_pred[nc_m] == 0)) if np.any(nc_m) else 0.0
+                era_pids = [
+                    p for p in sorted_pids
+                    if p in pid_to_year and ((pid_to_year[p] < 2017) if era_name == "pre_2017_adni2" else (pid_to_year[p] >= 2017))
+                ]
+                era_scan_acc = float(np.mean([pid_correct_map[p] for p in era_pids])) if era_pids else 0.0
+                era_stratified[era_name] = {
+                    "num_slices": int(np.sum(mask)),
+                    "num_scans": int(len(era_pids)),
+                    "ad_slices": int(np.sum(ad_m)),
+                    "nc_slices": int(np.sum(nc_m)),
+                    "slice_accuracy": round(float(accuracy_score(ey_true, ey_pred)), 4),
+                    "balanced_accuracy": round(float(0.5 * (ad_rec + nc_rec)), 4),
+                    "ad_recall": round(ad_rec, 4),
+                    "nc_recall": round(nc_rec, 4),
+                    "auroc": round(float(roc_auc_score(ey_true, ey_score)), 4) if len(np.unique(ey_true)) > 1 else 0.0,
+                    "scan_accuracy": round(era_scan_acc, 4),
+                }
+
+        # Empirical accuracy & false negative rate across 5 relative slice position (rel_pos) quintiles
+        pid_min_max = {p: (min(idxs), max(idxs)) for p, idxs in pid_slice_indices.items()}
+        rel_positions = np.array(
+            [
+                (int(m.get("slice_index", 0)) - pid_min_max[str(m["patient_id"])][0])
+                / max(1, pid_min_max[str(m["patient_id"])][1] - pid_min_max[str(m["patient_id"])][0])
+                for m in metas
+            ],
+            dtype=np.float64,
+        )
+        quintile_edges = [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.0001)]
+        for q_idx, (q_lo, q_hi) in enumerate(quintile_edges):
+            q_mask = (rel_positions >= q_lo) & (rel_positions < q_hi)
+            if not np.any(q_mask):
+                continue
+            qy_true = y_true[q_mask]
+            qy_pred = y_pred[q_mask]
+            q_ad = qy_true == 1
+            q_nc = qy_true == 0
+            q_fn_rate = float(np.mean(qy_pred[q_ad] == 0)) if np.any(q_ad) else 0.0
+            q_fp_rate = float(np.mean(qy_pred[q_nc] == 1)) if np.any(q_nc) else 0.0
+            slice_position_quintiles.append(
+                {
+                    "quintile": q_idx + 1,
+                    "rel_pos_range": f"[{q_lo:.1f}, {min(1.0, q_hi):.1f}{']' if q_idx == 4 else ')'}",
+                    "num_slices": int(np.sum(q_mask)),
+                    "accuracy": round(float(accuracy_score(qy_true, qy_pred)), 4),
+                    "fn_rate_on_ad": round(q_fn_rate, 4),
+                    "fp_rate_on_nc": round(q_fp_rate, 4),
+                    "mean_confidence": round(float(np.mean(cal_conf[q_mask])), 4),
+                }
+            )
 
     # ROC and PR curves for plotting
     fpr, tpr, _ = roc_curve(y_true, y_score_ad)
@@ -384,7 +484,17 @@ def compute_comprehensive_metrics(
         (e for e in triage_sweep if abs(e["threshold"] - tau_eval) < 1e-4),
         triage_sweep[0],
     )
+    tau_scan_eval = (
+        selected_scan_tau
+        if selected_scan_tau is not None
+        else (select_validation_triage_threshold(scan_triage_sweep) if scan_triage_sweep else tau_eval)
+    )
     operating_point_scan = (
+        next((e for e in scan_triage_sweep if abs(e["threshold"] - tau_scan_eval) < 1e-4), scan_triage_sweep[0])
+        if scan_triage_sweep
+        else {}
+    )
+    operating_point_scan_at_slice_tau = (
         next((e for e in scan_triage_sweep if abs(e["threshold"] - tau_eval) < 1e-4), scan_triage_sweep[0])
         if scan_triage_sweep
         else {}
@@ -412,8 +522,12 @@ def compute_comprehensive_metrics(
         "temperature": float(temperature),
         "triage_prob_source": "temperature_scaled" if use_calibrated_for_triage else "uncalibrated_raw_fallback",
         "selected_tau": float(tau_eval),
+        "selected_scan_tau": float(tau_scan_eval),
         "operating_point_slice": operating_point_slice,
         "operating_point_scan": operating_point_scan,
+        "operating_point_scan_at_slice_tau": operating_point_scan_at_slice_tau,
+        "era_stratified": era_stratified,
+        "slice_position_quintiles": slice_position_quintiles,
         "ece_uncalibrated": ece_raw,
         "ece_calibrated": ece_cal,
         "brier_uncalibrated": brier_raw,
@@ -615,15 +729,9 @@ def train_single_model(
     val_logits_best, val_labels_best, val_metas = collect_logits_and_labels(model, val_loader, device)
     cal_wrapper = TemperatureScaledClassifier(model, init_temperature=1.0).to(device)
     optimal_temp = cal_wrapper.fit_temperature(val_logits_best.to(device), val_labels_best.to(device))
+    use_cal_for_triage = True
 
-    # Check on validation set whether Temperature Scaling improves ECE; fallback to raw if it degrades
-    val_raw_probs = F.softmax(val_logits_best, dim=-1).numpy()
-    val_cal_probs = F.softmax(val_logits_best / optimal_temp, dim=-1).numpy()
-    val_ece_raw, _ = compute_ece(val_raw_probs, val_labels_best.numpy())
-    val_ece_cal, _ = compute_ece(val_cal_probs, val_labels_best.numpy())
-    use_cal_for_triage = bool(val_ece_cal <= val_ece_raw + 1e-4)
-
-    # Compute validation metrics and select operating threshold tau* STRICTLY on validation set
+    # Compute validation metrics and select slice & scan operating thresholds tau* STRICTLY on validation set
     val_metrics = compute_comprehensive_metrics(
         val_logits_best,
         val_labels_best,
@@ -631,8 +739,10 @@ def train_single_model(
         metas=val_metas,
         use_calibrated_for_triage=use_cal_for_triage,
         selected_tau=None,
+        selected_scan_tau=None,
     )
     val_selected_tau = float(val_metrics["selected_tau"])
+    val_selected_scan_tau = float(val_metrics["selected_scan_tau"])
 
     # Save checkpoint to git-ignored checkpoints/ directory
     CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -645,13 +755,14 @@ def train_single_model(
                 "temperature": optimal_temp,
                 "use_calibrated_for_triage": use_cal_for_triage,
                 "val_selected_tau": val_selected_tau,
+                "val_selected_scan_tau": val_selected_scan_tau,
                 "image_size": image_size,
                 "state_dict": model.state_dict(),
             },
             ckpt_path,
         )
 
-    # Final evaluation on held-out test set using validation-selected tau*
+    # Final evaluation on held-out test set using validation-selected slice tau* and scan tau*_scan
     test_logits, test_labels, test_metas = collect_logits_and_labels(model, test_loader, device)
     test_metrics = compute_comprehensive_metrics(
         test_logits,
@@ -660,16 +771,24 @@ def train_single_model(
         metas=test_metas,
         use_calibrated_for_triage=use_cal_for_triage,
         selected_tau=val_selected_tau,
+        selected_scan_tau=val_selected_scan_tau,
     )
 
     eval_batch_size = int(getattr(train_loader, "batch_size", 128) or 128)
     latency_profile = profile_inference_latency(
         model, device=device, image_size=image_size, batch_size=eval_batch_size
     )
+    mem_val_mb = round(float(peak_mem_mb), 2)
     resource_profile = {
         "total_params": total_params,
         "trainable_params": trainable_params,
-        "peak_memory_mb": round(float(peak_mem_mb), 2),
+        "steady_state_tensor_memory_mb": mem_val_mb,
+        "peak_memory_mb": mem_val_mb,
+        "memory_telemetry_metric": (
+            "cuda_max_memory_allocated_mb"
+            if device.type == "cuda"
+            else "mps_current_allocated_post_backward_steady_state_mb"
+        ),
         "total_train_time_sec": float(total_train_sec),
         "mean_epoch_time_sec": float(np.mean(history["epoch_time_sec"])),
         "best_epoch": best_epoch,
@@ -682,8 +801,8 @@ def train_single_model(
         f"Scan Acc={test_metrics['patient_level'].get('patient_accuracy', 0.0):.4f} | "
         f"Macro-F1={test_metrics['macro_f1']:.4f} | "
         f"AUROC={test_metrics['auroc']:.4f} | "
-        f"T*={optimal_temp:.3f} ({test_metrics['triage_prob_source']}) | "
-        f"Val-Selected τ*={val_selected_tau:.2f} | "
+        f"T*={optimal_temp:.3f} | "
+        f"Val τ*_slice={val_selected_tau:.2f}, τ*_scan={val_selected_scan_tau:.2f} | "
         f"ECE: {test_metrics['ece_uncalibrated']:.4f} -> {test_metrics['ece_calibrated']:.4f}"
     )
 
@@ -997,7 +1116,7 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=str,
         default="both",
-        choices=["both", "convnext", "baseline", "convnext_tiny"],
+        choices=["both", "convnext", "convnext_bn_stem", "baseline", "convnext_tiny"],
         help="Model architecture to train (`both` runs ConvNeXt and SimpleCNNBaseline).",
     )
     parser.add_argument("--image_size", type=int, default=96, help="Input spatial resolution.")
@@ -1027,9 +1146,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def _aggregate_multiseed_metrics(seed_runs: List[Dict[str, object]]) -> Dict[str, object]:
-    """Compute mean and standard deviation across multiple random seeds for each model."""
+    """Compute sample mean and unbiased sample standard deviation (`ddof=1`) across seeds for each model."""
     models = list(seed_runs[0]["models"].keys())
     agg: Dict[str, object] = {}
+    ddof = 1 if len(seed_runs) > 1 else 0
     scalar_keys = [
         "accuracy",
         "balanced_accuracy",
@@ -1038,6 +1158,7 @@ def _aggregate_multiseed_metrics(seed_runs: List[Dict[str, object]]) -> Dict[str
         "pr_auc",
         "temperature",
         "selected_tau",
+        "selected_scan_tau",
         "ece_uncalibrated",
         "ece_calibrated",
         "brier_uncalibrated",
@@ -1057,17 +1178,19 @@ def _aggregate_multiseed_metrics(seed_runs: List[Dict[str, object]]) -> Dict[str
     for m_name in models:
         m_agg: Dict[str, object] = {"slice_level": {}, "patient_level": {}, "per_seed": []}
         for sk in scalar_keys:
-            vals = [float(r["models"][m_name]["test_metrics"][sk]) for r in seed_runs]
+            vals = [float(r["models"][m_name]["test_metrics"].get(sk, 0.0)) for r in seed_runs]
             m_agg["slice_level"][sk] = {
                 "mean": round(float(np.mean(vals)), 4),
-                "std": round(float(np.std(vals, ddof=0)), 4),
+                "std": round(float(np.std(vals, ddof=ddof)), 4),
+                "ddof": ddof,
                 "values": [round(v, 4) for v in vals],
             }
         for pk in patient_keys:
             vals = [float(r["models"][m_name]["test_metrics"]["patient_level"].get(pk, 0.0)) for r in seed_runs]
             m_agg["patient_level"][pk] = {
                 "mean": round(float(np.mean(vals)), 4),
-                "std": round(float(np.std(vals, ddof=0)), 4),
+                "std": round(float(np.std(vals, ddof=ddof)), 4),
+                "ddof": ddof,
                 "values": [round(v, 4) for v in vals],
             }
         for r in seed_runs:
@@ -1083,9 +1206,28 @@ def _aggregate_multiseed_metrics(seed_runs: List[Dict[str, object]]) -> Dict[str
                     "ece_uncalibrated": round(float(tm["ece_uncalibrated"]), 4),
                     "ece_calibrated": round(float(tm["ece_calibrated"]), 4),
                     "selected_tau": round(float(tm["selected_tau"]), 2),
+                    "selected_scan_tau": round(float(tm.get("selected_scan_tau", tm["selected_tau"])), 2),
                 }
             )
         agg[m_name] = m_agg
+
+    if "baseline" in models and "convnext" in models:
+        paired: Dict[str, object] = {}
+        for k_label, getter in [
+            ("slice_accuracy", lambda r, m: float(r["models"][m]["test_metrics"]["accuracy"])),
+            ("scan_accuracy", lambda r, m: float(r["models"][m]["test_metrics"]["patient_level"].get("patient_accuracy", 0.0))),
+            ("subject_accuracy", lambda r, m: float(r["models"][m]["test_metrics"]["patient_level"].get("subject_accuracy", 0.0))),
+            ("macro_f1", lambda r, m: float(r["models"][m]["test_metrics"]["macro_f1"])),
+            ("auroc", lambda r, m: float(r["models"][m]["test_metrics"]["auroc"])),
+        ]:
+            diffs = [getter(r, "baseline") - getter(r, "convnext") for r in seed_runs]
+            paired[k_label] = {
+                "mean_diff_baseline_minus_convnext": round(float(np.mean(diffs)), 4),
+                "std_diff_ddof1": round(float(np.std(diffs, ddof=ddof)), 4),
+                "per_seed_diffs": [round(d, 4) for d in diffs],
+            }
+        agg["paired_baseline_minus_convnext"] = paired
+
     return agg
 
 
