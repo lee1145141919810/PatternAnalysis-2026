@@ -64,7 +64,11 @@
         "batched_per_slice_latency_ms": 0.029571744791667687,
         "throughput_slices_per_sec": 33816.063510793116,
         "steady_state_tensor_memory_mb": 4.67,
-        "memory_telemetry_metric": "mps_current_allocated_post_backward_steady_state_mb"
+        "memory_telemetry_metric": "mps_current_allocated_post_backward_steady_state_mb",
+        "model_param_buffer_mb": 0.027,
+        "inference_input_batch_mb": 4.5,
+        "inference_max_single_activation_mb": 36.0,
+        "inference_analytical_peak_mb": 94.53
       },
       "val_metrics": {
         "accuracy": 0.7658333333333334,
@@ -129,29 +133,81 @@
           "system_hybrid_accuracy": 0.95
         },
         "era_stratified": {
+          "unknown_year_slices": 0,
+          "unknown_year_scans": 0,
           "pre_2017_adni2": {
             "num_slices": 560,
             "num_scans": 28,
+            "ad_scans": 28,
+            "nc_scans": 0,
+            "num_subjects": 28,
+            "ad_subjects": 28,
+            "nc_subjects": 0,
             "ad_slices": 560,
             "nc_slices": 0,
             "slice_accuracy": 0.8768,
             "balanced_accuracy": 0.4384,
+            "balanced_accuracy_ci95": [
+              0.7821,
+              0.9554
+            ],
             "ad_recall": 0.8768,
+            "ad_recall_ci95": [
+              0.7821,
+              0.9554
+            ],
             "nc_recall": 0.0,
+            "nc_recall_ci95": [
+              0.0,
+              0.0
+            ],
             "auroc": 0.0,
-            "scan_accuracy": 0.8929
+            "auroc_ci95": [
+              0.0,
+              0.0
+            ],
+            "scan_accuracy": 0.8929,
+            "scan_accuracy_ci95": [
+              0.75,
+              1.0
+            ]
           },
           "post_2017_adni3": {
             "num_slices": 640,
             "num_scans": 32,
+            "ad_scans": 2,
+            "nc_scans": 30,
+            "num_subjects": 32,
+            "ad_subjects": 2,
+            "nc_subjects": 30,
             "ad_slices": 40,
             "nc_slices": 600,
             "slice_accuracy": 0.6687,
             "balanced_accuracy": 0.8,
+            "balanced_accuracy_ci95": [
+              0.7308,
+              0.87
+            ],
             "ad_recall": 0.95,
+            "ad_recall_ci95": [
+              0.9,
+              1.0
+            ],
             "nc_recall": 0.65,
+            "nc_recall_ci95": [
+              0.5366,
+              0.77
+            ],
             "auroc": 0.8589,
-            "scan_accuracy": 0.7188
+            "auroc_ci95": [
+              0.7447,
+              0.957
+            ],
+            "scan_accuracy": 0.7188,
+            "scan_accuracy_ci95": [
+              0.5625,
+              0.8438
+            ]
           }
         },
         "slice_position_quintiles": [
@@ -160,6 +216,10 @@
             "rel_pos_range": "[0.0, 0.2)",
             "num_slices": 240,
             "accuracy": 0.7417,
+            "accuracy_ci95": [
+              0.6416,
+              0.8375
+            ],
             "fn_rate_on_ad": 0.075,
             "fp_rate_on_nc": 0.4417,
             "mean_confidence": 0.7691
@@ -169,6 +229,10 @@
             "rel_pos_range": "[0.2, 0.4)",
             "num_slices": 240,
             "accuracy": 0.7667,
+            "accuracy_ci95": [
+              0.6667,
+              0.8583
+            ],
             "fn_rate_on_ad": 0.125,
             "fp_rate_on_nc": 0.3417,
             "mean_confidence": 0.7589
@@ -178,6 +242,10 @@
             "rel_pos_range": "[0.4, 0.6)",
             "num_slices": 240,
             "accuracy": 0.7833,
+            "accuracy_ci95": [
+              0.6916,
+              0.8667
+            ],
             "fn_rate_on_ad": 0.075,
             "fp_rate_on_nc": 0.3583,
             "mean_confidence": 0.7512
@@ -187,6 +255,10 @@
             "rel_pos_range": "[0.6, 0.8)",
             "num_slices": 240,
             "accuracy": 0.8083,
+            "accuracy_ci95": [
+              0.7166,
+              0.8917
+            ],
             "fn_rate_on_ad": 0.15,
             "fp_rate_on_nc": 0.2333,
             "mean_confidence": 0.7564
@@ -196,6 +268,10 @@
             "rel_pos_range": "[0.8, 1.0]",
             "num_slices": 240,
             "accuracy": 0.7292,
+            "accuracy_ci95": [
+              0.6291,
+              0.8209
+            ],
             "fn_rate_on_ad": 0.1667,
             "fp_rate_on_nc": 0.375,
             "mean_confidence": 0.7738
@@ -580,29 +656,81 @@
           "system_hybrid_accuracy": 0.9838709677419355
         },
         "era_stratified": {
+          "unknown_year_slices": 0,
+          "unknown_year_scans": 0,
           "pre_2017_adni2": {
             "num_slices": 580,
             "num_scans": 29,
+            "ad_scans": 29,
+            "nc_scans": 0,
+            "num_subjects": 29,
+            "ad_subjects": 29,
+            "nc_subjects": 0,
             "ad_slices": 580,
             "nc_slices": 0,
             "slice_accuracy": 0.9155,
             "balanced_accuracy": 0.4578,
+            "balanced_accuracy_ci95": [
+              0.8569,
+              0.9638
+            ],
             "ad_recall": 0.9155,
+            "ad_recall_ci95": [
+              0.8569,
+              0.9638
+            ],
             "nc_recall": 0.0,
+            "nc_recall_ci95": [
+              0.0,
+              0.0
+            ],
             "auroc": 0.0,
-            "scan_accuracy": 0.9655
+            "auroc_ci95": [
+              0.0,
+              0.0
+            ],
+            "scan_accuracy": 0.9655,
+            "scan_accuracy_ci95": [
+              0.8621,
+              1.0
+            ]
           },
           "post_2017_adni3": {
             "num_slices": 660,
             "num_scans": 33,
+            "ad_scans": 2,
+            "nc_scans": 31,
+            "num_subjects": 33,
+            "ad_subjects": 2,
+            "nc_subjects": 31,
             "ad_slices": 40,
             "nc_slices": 620,
             "slice_accuracy": 0.7591,
             "balanced_accuracy": 0.7899,
+            "balanced_accuracy_ci95": [
+              0.696,
+              0.8847
+            ],
             "ad_recall": 0.825,
+            "ad_recall_ci95": [
+              0.7,
+              0.95
+            ],
             "nc_recall": 0.7548,
+            "nc_recall_ci95": [
+              0.6483,
+              0.8517
+            ],
             "auroc": 0.8948,
-            "scan_accuracy": 0.8485
+            "auroc_ci95": [
+              0.8189,
+              0.9606
+            ],
+            "scan_accuracy": 0.8485,
+            "scan_accuracy_ci95": [
+              0.7273,
+              0.9697
+            ]
           }
         },
         "slice_position_quintiles": [
@@ -611,6 +739,10 @@
             "rel_pos_range": "[0.0, 0.2)",
             "num_slices": 248,
             "accuracy": 0.8468,
+            "accuracy_ci95": [
+              0.7621,
+              0.9194
+            ],
             "fn_rate_on_ad": 0.0484,
             "fp_rate_on_nc": 0.2581,
             "mean_confidence": 0.7821
@@ -620,6 +752,10 @@
             "rel_pos_range": "[0.2, 0.4)",
             "num_slices": 248,
             "accuracy": 0.8589,
+            "accuracy_ci95": [
+              0.7944,
+              0.9194
+            ],
             "fn_rate_on_ad": 0.0887,
             "fp_rate_on_nc": 0.1935,
             "mean_confidence": 0.7728
@@ -629,6 +765,10 @@
             "rel_pos_range": "[0.4, 0.6)",
             "num_slices": 248,
             "accuracy": 0.7903,
+            "accuracy_ci95": [
+              0.7177,
+              0.8629
+            ],
             "fn_rate_on_ad": 0.1532,
             "fp_rate_on_nc": 0.2661,
             "mean_confidence": 0.7322
@@ -638,6 +778,10 @@
             "rel_pos_range": "[0.6, 0.8)",
             "num_slices": 248,
             "accuracy": 0.8427,
+            "accuracy_ci95": [
+              0.7621,
+              0.9194
+            ],
             "fn_rate_on_ad": 0.0887,
             "fp_rate_on_nc": 0.2258,
             "mean_confidence": 0.7526
@@ -647,6 +791,10 @@
             "rel_pos_range": "[0.8, 1.0]",
             "num_slices": 248,
             "accuracy": 0.8226,
+            "accuracy_ci95": [
+              0.7339,
+              0.8992
+            ],
             "fn_rate_on_ad": 0.0726,
             "fp_rate_on_nc": 0.2823,
             "mean_confidence": 0.7917
@@ -982,7 +1130,11 @@
         "batched_per_slice_latency_ms": 0.34089778645833846,
         "throughput_slices_per_sec": 2933.4306050773116,
         "steady_state_tensor_memory_mb": 41.9,
-        "memory_telemetry_metric": "mps_current_allocated_post_backward_steady_state_mb"
+        "memory_telemetry_metric": "mps_current_allocated_post_backward_steady_state_mb",
+        "model_param_buffer_mb": 8.304,
+        "inference_input_batch_mb": 4.5,
+        "inference_max_single_activation_mb": 36.0,
+        "inference_analytical_peak_mb": 102.8
       },
       "val_metrics": {
         "accuracy": 0.8341666666666666,
@@ -1047,29 +1199,81 @@
           "system_hybrid_accuracy": 0.9666666666666667
         },
         "era_stratified": {
+          "unknown_year_slices": 0,
+          "unknown_year_scans": 0,
           "pre_2017_adni2": {
             "num_slices": 560,
             "num_scans": 28,
+            "ad_scans": 28,
+            "nc_scans": 0,
+            "num_subjects": 28,
+            "ad_subjects": 28,
+            "nc_subjects": 0,
             "ad_slices": 560,
             "nc_slices": 0,
             "slice_accuracy": 0.8268,
             "balanced_accuracy": 0.4134,
+            "balanced_accuracy_ci95": [
+              0.7411,
+              0.9179
+            ],
             "ad_recall": 0.8268,
+            "ad_recall_ci95": [
+              0.7411,
+              0.9179
+            ],
             "nc_recall": 0.0,
+            "nc_recall_ci95": [
+              0.0,
+              0.0
+            ],
             "auroc": 0.0,
-            "scan_accuracy": 0.8571
+            "auroc_ci95": [
+              0.0,
+              0.0
+            ],
+            "scan_accuracy": 0.8571,
+            "scan_accuracy_ci95": [
+              0.7143,
+              0.9643
+            ]
           },
           "post_2017_adni3": {
             "num_slices": 640,
             "num_scans": 32,
+            "ad_scans": 2,
+            "nc_scans": 30,
+            "num_subjects": 32,
+            "ad_subjects": 2,
+            "nc_subjects": 30,
             "ad_slices": 40,
             "nc_slices": 600,
             "slice_accuracy": 0.8406,
             "balanced_accuracy": 0.8917,
+            "balanced_accuracy_ci95": [
+              0.8275,
+              0.95
+            ],
             "ad_recall": 0.95,
+            "ad_recall_ci95": [
+              0.9,
+              1.0
+            ],
             "nc_recall": 0.8333,
+            "nc_recall_ci95": [
+              0.7216,
+              0.925
+            ],
             "auroc": 0.9261,
-            "scan_accuracy": 0.8438
+            "auroc_ci95": [
+              0.8573,
+              0.9788
+            ],
+            "scan_accuracy": 0.8438,
+            "scan_accuracy_ci95": [
+              0.7188,
+              0.9688
+            ]
           }
         },
         "slice_position_quintiles": [
@@ -1078,6 +1282,10 @@
             "rel_pos_range": "[0.0, 0.2)",
             "num_slices": 240,
             "accuracy": 0.8583,
+            "accuracy_ci95": [
+              0.7792,
+              0.9292
+            ],
             "fn_rate_on_ad": 0.1167,
             "fp_rate_on_nc": 0.1667,
             "mean_confidence": 0.8207
@@ -1087,6 +1295,10 @@
             "rel_pos_range": "[0.2, 0.4)",
             "num_slices": 240,
             "accuracy": 0.85,
+            "accuracy_ci95": [
+              0.7792,
+              0.9125
+            ],
             "fn_rate_on_ad": 0.125,
             "fp_rate_on_nc": 0.175,
             "mean_confidence": 0.8103
@@ -1096,6 +1308,10 @@
             "rel_pos_range": "[0.4, 0.6)",
             "num_slices": 240,
             "accuracy": 0.8375,
+            "accuracy_ci95": [
+              0.7583,
+              0.9083
+            ],
             "fn_rate_on_ad": 0.1417,
             "fp_rate_on_nc": 0.1833,
             "mean_confidence": 0.8233
@@ -1105,6 +1321,10 @@
             "rel_pos_range": "[0.6, 0.8)",
             "num_slices": 240,
             "accuracy": 0.8125,
+            "accuracy_ci95": [
+              0.725,
+              0.8875
+            ],
             "fn_rate_on_ad": 0.2167,
             "fp_rate_on_nc": 0.1583,
             "mean_confidence": 0.8149
@@ -1114,6 +1334,10 @@
             "rel_pos_range": "[0.8, 1.0]",
             "num_slices": 240,
             "accuracy": 0.8125,
+            "accuracy_ci95": [
+              0.7207,
+              0.8959
+            ],
             "fn_rate_on_ad": 0.225,
             "fp_rate_on_nc": 0.15,
             "mean_confidence": 0.8254
@@ -1498,29 +1722,81 @@
           "system_hybrid_accuracy": 1.0
         },
         "era_stratified": {
+          "unknown_year_slices": 0,
+          "unknown_year_scans": 0,
           "pre_2017_adni2": {
             "num_slices": 580,
             "num_scans": 29,
+            "ad_scans": 29,
+            "nc_scans": 0,
+            "num_subjects": 29,
+            "ad_subjects": 29,
+            "nc_subjects": 0,
             "ad_slices": 580,
             "nc_slices": 0,
             "slice_accuracy": 0.8466,
             "balanced_accuracy": 0.4233,
+            "balanced_accuracy_ci95": [
+              0.7844,
+              0.9121
+            ],
             "ad_recall": 0.8466,
+            "ad_recall_ci95": [
+              0.7844,
+              0.9121
+            ],
             "nc_recall": 0.0,
+            "nc_recall_ci95": [
+              0.0,
+              0.0
+            ],
             "auroc": 0.0,
-            "scan_accuracy": 0.9655
+            "auroc_ci95": [
+              0.0,
+              0.0
+            ],
+            "scan_accuracy": 0.9655,
+            "scan_accuracy_ci95": [
+              0.8966,
+              1.0
+            ]
           },
           "post_2017_adni3": {
             "num_slices": 660,
             "num_scans": 33,
+            "ad_scans": 2,
+            "nc_scans": 31,
+            "num_subjects": 33,
+            "ad_subjects": 2,
+            "nc_subjects": 31,
             "ad_slices": 40,
             "nc_slices": 620,
             "slice_accuracy": 0.8939,
             "balanced_accuracy": 0.9202,
+            "balanced_accuracy_ci95": [
+              0.8887,
+              0.9468
+            ],
             "ad_recall": 0.95,
+            "ad_recall_ci95": [
+              0.95,
+              0.95
+            ],
             "nc_recall": 0.8903,
+            "nc_recall_ci95": [
+              0.8274,
+              0.9435
+            ],
             "auroc": 0.9576,
-            "scan_accuracy": 0.9091
+            "auroc_ci95": [
+              0.9224,
+              0.9827
+            ],
+            "scan_accuracy": 0.9091,
+            "scan_accuracy_ci95": [
+              0.7879,
+              1.0
+            ]
           }
         },
         "slice_position_quintiles": [
@@ -1529,6 +1805,10 @@
             "rel_pos_range": "[0.0, 0.2)",
             "num_slices": 248,
             "accuracy": 0.879,
+            "accuracy_ci95": [
+              0.7984,
+              0.9435
+            ],
             "fn_rate_on_ad": 0.1371,
             "fp_rate_on_nc": 0.1048,
             "mean_confidence": 0.8325
@@ -1538,6 +1818,10 @@
             "rel_pos_range": "[0.2, 0.4)",
             "num_slices": 248,
             "accuracy": 0.8871,
+            "accuracy_ci95": [
+              0.8265,
+              0.9477
+            ],
             "fn_rate_on_ad": 0.129,
             "fp_rate_on_nc": 0.0968,
             "mean_confidence": 0.7953
@@ -1547,6 +1831,10 @@
             "rel_pos_range": "[0.4, 0.6)",
             "num_slices": 248,
             "accuracy": 0.8347,
+            "accuracy_ci95": [
+              0.7621,
+              0.9032
+            ],
             "fn_rate_on_ad": 0.1855,
             "fp_rate_on_nc": 0.1452,
             "mean_confidence": 0.7736
@@ -1556,6 +1844,10 @@
             "rel_pos_range": "[0.6, 0.8)",
             "num_slices": 248,
             "accuracy": 0.8548,
+            "accuracy_ci95": [
+              0.7863,
+              0.9153
+            ],
             "fn_rate_on_ad": 0.1855,
             "fp_rate_on_nc": 0.1048,
             "mean_confidence": 0.8065
@@ -1565,6 +1857,10 @@
             "rel_pos_range": "[0.8, 1.0]",
             "num_slices": 248,
             "accuracy": 0.9032,
+            "accuracy_ci95": [
+              0.8306,
+              0.9637
+            ],
             "fn_rate_on_ad": 0.0968,
             "fp_rate_on_nc": 0.0968,
             "mean_confidence": 0.8024
@@ -1887,5 +2183,6 @@
         ]
       }
     }
-  }
+  },
+  "git_commit": "b1ce43b"
 }

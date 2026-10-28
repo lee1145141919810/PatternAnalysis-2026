@@ -10,7 +10,8 @@ checkpoints/
 data/
 ADNI/
 AD_NC/
-logs/
+/logs/
+!results/logs/
 __pycache__/
 *.pyc
 .DS_Store

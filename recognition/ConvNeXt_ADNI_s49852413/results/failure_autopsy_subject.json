@@ -18,6 +18,7 @@
     "calibrated_confidence": 0.5006,
     "predictive_entropy": 1.0,
     "baseline_confidence": 0.635,
+    "baseline_scan_20slice_mean_prob_ad": 0.4366,
     "brain_foreground_fraction": 0.4293,
     "central_csf_dark_fraction": 0.471,
     "gradcam_stage2_peak_rc": [
@@ -50,6 +51,7 @@
     "calibrated_confidence": 0.85,
     "predictive_entropy": 0.6098,
     "baseline_confidence": 0.7626,
+    "baseline_scan_20slice_mean_prob_ad": 0.5436,
     "brain_foreground_fraction": 0.6152,
     "central_csf_dark_fraction": 0.418,
     "gradcam_stage2_peak_rc": [
@@ -82,6 +84,7 @@
     "calibrated_confidence": 0.5001,
     "predictive_entropy": 1.0,
     "baseline_confidence": 0.9012,
+    "baseline_scan_20slice_mean_prob_ad": 0.1044,
     "brain_foreground_fraction": 0.5285,
     "central_csf_dark_fraction": 0.2106,
     "gradcam_stage2_peak_rc": [
@@ -114,6 +117,7 @@
     "calibrated_confidence": 0.8085,
     "predictive_entropy": 0.7047,
     "baseline_confidence": 0.751,
+    "baseline_scan_20slice_mean_prob_ad": 0.794,
     "brain_foreground_fraction": 0.4455,
     "central_csf_dark_fraction": 0.4171,
     "gradcam_stage2_peak_rc": [
